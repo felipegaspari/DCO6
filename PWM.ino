@@ -113,6 +113,29 @@ const uint16_t PWM_STATIC_ZERO = 0;
 
 static uint32_t dither_ring_buffers[NUM_OSCILLATORS + NUM_PW_CHANNELS][PWM_DITHER_STEPS] __attribute__((aligned(PWM_DITHER_BYTES)));
 
+// -----------------------------------------------------------------------------
+// SHARED CV STORAGE
+// -----------------------------------------------------------------------------
+// Stores CV values for channels that share a slice with the DMA/Direct voice engine.
+static uint16_t shared_slice_cv[NUM_PWM_SLICES][2] = {0};
+
+/**
+ * @brief Safely writes a PWM level, either to raw hardware or via the DMA route engine
+ * if the slice is shared with a voice.
+ */
+static inline void SRAM_HOT(safe_pwm_set_level)(uint8_t slice, uint8_t chan, uint16_t level) {
+  int route_idx = get_route_for_slice(slice); // O(1) lookup
+  if (__builtin_expect(route_idx >= 0, 0)) {
+    // Slice is managed by the Voice engine. Update RAM and trigger a render frame.
+    shared_slice_cv[slice][chan & 1] = level;
+    render_single_dma_route((uint8_t)route_idx);
+  } else {
+    // Standard unshared slice. Write directly to hardware.
+    pwm_set_chan_level(slice, chan, level);
+  }
+}
+////////////////////////////////////////////////////////////////////////////////////////
+
 void init_pwm() {
   for (int i = 0; i < NUM_PWM_SLICES; i++) {
     slice_to_route_map[i] = -1;
@@ -127,7 +150,7 @@ void init_pwm() {
     pwm_set_enabled(RANGE_PWM_SLICES[i], true);
   }
 
-  // 2. PW Channels (Native 10-bit, NO DITHER, Clean 146.5 kHz Carrier)
+  // 2. PW Channels 
   for (int i = 0; i < NUM_PW_CHANNELS; i++) {
     if (PW_PINS[i] == PW_PIN_UNASSIGNED) {
       PW_PWM_SLICES[i] = 0xFF;
@@ -136,21 +159,33 @@ void init_pwm() {
     gpio_set_function(PW_PINS[i], GPIO_FUNC_PWM);
     PW_PWM_SLICES[i] = pwm_gpio_to_slice_num(PW_PINS[i]);
     PW_PWM_CHANNELS[i] = pwm_gpio_to_channel(PW_PINS[i]);
+    
+#if ENABLE_PW_DITHER
+    // Dithered PW Wrap (matches Range strategy)
+    pwm_set_wrap(PW_PWM_SLICES[i], DIV_COUNTER_PW >> PWM_DITHER_BITS);
+#else
     // Full 10-bit wrap: 1023 (1024 ticks -> 150 MHz / 1024 = 146.48 kHz)
     pwm_set_wrap(PW_PWM_SLICES[i], DIV_COUNTER_PW - 1);
+#endif
+    
     pwm_set_enabled(PW_PWM_SLICES[i], true);
   }
 
   // =========================================================================
-  // BIND DIRECT HARDWARE POINTERS (Range = DMA Dither, PW = Direct Register)
+  // BIND DIRECT HARDWARE POINTERS (Range = DMA Dither, PW = Flag Dependent)
   // =========================================================================
   num_voice_routes = 0;
 
   for (int s = 0; s < NUM_PWM_SLICES; s++) {
-    const uint16_t* p_a = &PWM_STATIC_ZERO;
-    const uint16_t* p_b = &PWM_STATIC_ZERO;
+    // OLD: const uint16_t* p_a = &PWM_STATIC_ZERO;
+    // OLD: const uint16_t* p_b = &PWM_STATIC_ZERO;
+
+    // NEW: Default to our RAM array so CVs can inject values here
+    const uint16_t* p_a = &shared_slice_cv[s][0];
+    const uint16_t* p_b = &shared_slice_cv[s][1];
+    
     bool slice_used = false;
-    bool is_dithered_range = false;
+    bool is_dithered_slice = false;
 
     // Check Range Oscillators
     for (int i = 0; i < NUM_OSCILLATORS; i++) {
@@ -158,7 +193,7 @@ void init_pwm() {
         if (RANGE_PWM_CHANNELS[i] == 0) p_a = &RANGE_PWM[i];
         else                            p_b = &RANGE_PWM[i];
         slice_used = true;
-        is_dithered_range = true;
+        is_dithered_slice = true;
       }
     }
 
@@ -169,6 +204,9 @@ void init_pwm() {
         if (chan == 0) p_a = &PW_PWM[i];
         else           p_b = &PW_PWM[i];
         slice_used = true;
+#if ENABLE_PW_DITHER
+        is_dithered_slice = true;   // <-- Trigger DMA generation for PW if flag is enabled
+#endif
       }
     }
 
@@ -178,8 +216,7 @@ void init_pwm() {
       active_voice_routes[num_voice_routes].src_a = p_a;
       active_voice_routes[num_voice_routes].src_b = p_b;
 
-      // ONLY claim and configure DMA for Range slices!
-      if (is_dithered_range) {
+      if (is_dithered_slice) {      // <-- Check new boolean name
         active_voice_routes[num_voice_routes].dma_buffer = dither_ring_buffers[num_voice_routes];
 
         int dma_chan = dma_claim_unused_channel(false);
@@ -327,13 +364,13 @@ void init_level_pwm() {
 }
 
 void write_level_pwm_raw(uint16_t osc1, uint16_t osc2, uint16_t osc3, uint16_t sub) {
-  pwm_set_chan_level(OSC1_LEVEL_PWM_SLICE, OSC1_LEVEL_PWM_CHAN,
+  safe_pwm_set_level(OSC1_LEVEL_PWM_SLICE, OSC1_LEVEL_PWM_CHAN,
                      scale_level_cv_to_wrap(osc1, OSC1_LEVEL_PWM_SLICE));
-  pwm_set_chan_level(OSC2_LEVEL_PWM_SLICE, OSC2_LEVEL_PWM_CHAN,
+  safe_pwm_set_level(OSC2_LEVEL_PWM_SLICE, OSC2_LEVEL_PWM_CHAN,
                      scale_level_cv_to_wrap(osc2, OSC2_LEVEL_PWM_SLICE));
-  pwm_set_chan_level(OSC3_LEVEL_PWM_SLICE, OSC3_LEVEL_PWM_CHAN,
+  safe_pwm_set_level(OSC3_LEVEL_PWM_SLICE, OSC3_LEVEL_PWM_CHAN,
                      scale_level_cv_to_wrap(osc3, OSC3_LEVEL_PWM_SLICE));
-  pwm_set_chan_level(SUB_LEVEL_PWM_SLICE, SUB_LEVEL_PWM_CHAN,
+  safe_pwm_set_level(SUB_LEVEL_PWM_SLICE, SUB_LEVEL_PWM_CHAN,
                      scale_level_cv_to_wrap(sub, SUB_LEVEL_PWM_SLICE));
 }
 
@@ -343,24 +380,24 @@ void write_level_pwm() {
 
 // Push raw compare values to the cutoff / per-filter resonance / VCA / dist slices.
 void write_cv_pwm_raw(uint16_t cutoff, const uint16_t resonance[NUM_FILTERS], uint16_t vca,
-                      uint16_t dist_drive, uint16_t dist_mix) {
-  for (int i = 0; i < NUM_FILTERS; i++) {
-    pwm_set_chan_level(CUTOFF_PWM_SLICES[i], CUTOFF_PWM_CHANS[i], cutoff);
+  uint16_t dist_drive, uint16_t dist_mix) {
+for (int i = 0; i < NUM_FILTERS; i++) {
+safe_pwm_set_level(CUTOFF_PWM_SLICES[i], CUTOFF_PWM_CHANS[i], cutoff);
 
-    uint16_t reso_level = resonance[i];
-    if (RESO_PWM_SLICES[i] == RANGE_PWM_SLICES[1]) {
-      // Shared wrap DIV_COUNTER with RANGE OSC2 — scale 0..4095 → 0..DIV_COUNTER via >>12.
-      reso_level = (uint16_t)(((uint32_t)resonance[i] * (uint32_t)DIV_COUNTER) >> 12);
-    }
-    pwm_set_chan_level(RESO_PWM_SLICES[i], RESO_PWM_CHANS[i], reso_level);
-  }
-  pwm_set_chan_level(VCA_PWM_SLICE, VCA_PWM_CHAN, vca);
+uint16_t reso_level = resonance[i];
+if (RESO_PWM_SLICES[i] == RANGE_PWM_SLICES[1]) {
+// Shared wrap DIV_COUNTER with RANGE OSC2 — scale 0..4095 → 0..DIV_COUNTER via >>12.
+reso_level = (uint16_t)(((uint32_t)resonance[i] * (uint32_t)DIV_COUNTER) >> 12);
+}
+safe_pwm_set_level(RESO_PWM_SLICES[i], RESO_PWM_CHANS[i], reso_level);
+}
+safe_pwm_set_level(VCA_PWM_SLICE, VCA_PWM_CHAN, vca);
 #ifndef ENABLE_VOICE_AUX
-  pwm_set_chan_level(DIST_DRIVE_PWM_SLICE, DIST_DRIVE_PWM_CHAN, dist_drive);
-  pwm_set_chan_level(DIST_MIX_PWM_SLICE, DIST_MIX_PWM_CHAN, dist_mix);
+safe_pwm_set_level(DIST_DRIVE_PWM_SLICE, DIST_DRIVE_PWM_CHAN, dist_drive);
+safe_pwm_set_level(DIST_MIX_PWM_SLICE, DIST_MIX_PWM_CHAN, dist_mix);
 #else
-  (void)dist_drive;
-  (void)dist_mix;
+(void)dist_drive;
+(void)dist_mix;
 #endif
 }
 

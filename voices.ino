@@ -9,10 +9,6 @@
 // Enable/disable detailed DCO debug report (including OSC1 frequency stages)
 #define DCO_DEBUG_REPORT 0
 
-static uint16_t pending_range_pwm[NUM_OSCILLATORS] = {0};
-static uint32_t pending_clk_div[NUM_OSCILLATORS]   = {0};
-static bool     range_sync_pending[NUM_OSCILLATORS] = {false};
-
 void SRAM_HOT(amp_chan_levels_fixed)(int64_t freq_q24_A, int64_t freq_q24_B,
                                   uint8_t oscA, uint8_t oscB, uint16_t *outA,
                                   uint16_t *outB);
@@ -90,6 +86,7 @@ static float SRAM_HOT(fast_exp2f_audio)(float p) {
   
   return approx * v.f;
 }
+
 
 // Boot init: seed notes, build pitch tables, apply voice mode, run one
 // voice_task_main().
@@ -353,60 +350,63 @@ static constexpr uint32_t PIO_INSTR_PUSH      = 0x8020;
 static constexpr uint32_t PIO_INSTR_PULL      = 0x80a0; 
 static constexpr uint32_t PIO_INSTR_MOV_X_OSR = 0xa027; 
 
+// =============================================================================
+// HEAVILY OPTIMIZED INSTANT PIO DIVIDER UPDATE (250 MHz / 10 µs Loop1)
+// =============================================================================
+static constexpr int32_t BUS_LATENCY_CYCLES = 43;  ///< Exactly compensates the 20-cent drop
+static constexpr int32_t SAFEGUARD_CYCLES   = 150; ///< ~600 ns threshold at 250 MHz
+
 static inline void SRAM_HOT(update_osc_clk_div_instantly)(PIO pio, uint sm, uint8_t osc, uint32_t new_div) {
   const uint32_t old_div = osc_last_clk_div[osc];
-  
-  // __builtin_expect forces GCC to keep the "no change" path branchless/straight-line
-  if (__builtin_expect(old_div != new_div, 1)) {
-      //const uint32_t irq = save_and_disable_interrupts();
+  if (__builtin_expect(old_div == new_div, 1)) return;
+
+  const uint32_t pc = pio->sm[sm].addr; 
+  if (__builtin_expect(pc != 0, 1)) {
       
-      // OPTIMIZATION: Direct Memory-Mapped IO (MMIO) Bypass
-      // pio->sm[sm].addr reads the Program Counter in 1 cycle, bypassing SDK checks
-      const uint32_t pc = pio->sm[sm].addr; 
-      
-      if (__builtin_expect(pc != 0, 1)) {
-          
-          // OPTIMIZATION: Direct Hardware FIFO Flush
-          // Bypasses the pio_sm_is_rx_fifo_empty() function call overhead entirely
-          const uint32_t empty_mask = (1u << (PIO_FSTAT_RXEMPTY_LSB + sm));
-          while (!(pio->fstat & empty_mask)) {
-              (void)pio->rxf[sm];
-          }
-          
-          // Inject state-machine instructions via direct MMIO
-          pio->sm[sm].instr = PIO_INSTR_IN_X_32;
-          pio->sm[sm].instr = PIO_INSTR_PUSH;
-          
-          // =========================================================================
-          // CRITICAL FIX: Cast to signed int32_t!
-          // When PIO completes a `jmp x--` loop, X underflows to 0xFFFFFFFF (-1).
-          // Casting to int32_t ensures -1 is NOT > 150, bypassing the fatal 34-second
-          // delay injection that occurs when treated as an unsigned 4.29 billion.
-          // =========================================================================
-          const int32_t current_x = (int32_t)pio->rxf[sm];
-          
-          if (__builtin_expect(current_x > 150, 1)) {
-              
-              // =========================================================================
-              // OPTIMIZATION PILLAR IV: Cortex-M33 FPU / DSP Exploitation
-              // =========================================================================
-              const float ratio = (float)new_div / (float)old_div;
-              const uint32_t new_x = (uint32_t)((float)current_x * ratio);
-              
-              pio->txf[sm] = new_x;
-              pio->sm[sm].instr = PIO_INSTR_PULL;
-              pio->sm[sm].instr = PIO_INSTR_MOV_X_OSR;
-          }
+      const uint32_t empty_mask = (1u << (PIO_FSTAT_RXEMPTY_LSB + sm));
+      while (!(pio->fstat & empty_mask)) {
+          (void)pio->rxf[sm];
       }
       
-      // Queue the new divider in the OSR for all subsequent chunk loops
-      pio->txf[sm] = new_div;
-      pio->sm[sm].instr = PIO_INSTR_PULL;
+      pio->sm[sm].instr = PIO_INSTR_IN_X_32;
+      pio->sm[sm].instr = PIO_INSTR_PUSH;
       
-      //restore_interrupts(irq);
-      osc_last_clk_div[osc] = new_div;
+      const int32_t current_x = (int32_t)pio->rxf[sm];
+      
+      // Safeguard 1: Do not rescale if the chunk has less than 600 ns left
+      if (__builtin_expect(current_x > SAFEGUARD_CYCLES, 1)) {
+          const float ratio = (float)new_div / (float)old_div;
+          const int32_t new_x = (int32_t)((float)current_x * ratio) - BUS_LATENCY_CYCLES;
+          
+          // Safeguard 2: Ensure an upward pitch jump doesn't compress new_x below 30 cycles
+          // (Protects the OSR pipeline race condition)
+          if (__builtin_expect(new_x > 30, 1)) {
+              pio->txf[sm] = (uint32_t)new_x;
+              pio->sm[sm].instr = PIO_INSTR_PULL;
+              pio->sm[sm].instr = PIO_INSTR_MOV_X_OSR;
+              __dmb(); // Guarantees X latches before queuing new_div
+          }
+      }
   }
+  
+  // Queue new_div in OSR for all subsequent chunk loops
+  pio->txf[sm] = new_div;
+  pio->sm[sm].instr = PIO_INSTR_PULL;
+  osc_last_clk_div[osc] = new_div;
 }
+
+uint32_t get_osc_clk_div(uint8_t osc, float freqHz) {
+  
+  uint32_t total_cycles1 = clkdiv_live_total_cycles(sysClock_Hz_cached_float, freqHz);
+  
+  uint32_t wA, kA, wB, kB;
+  get_osc_params(osc, wA, kA);
+  
+  uint32_t clk_div = pio_clk_div_for_y(total_cycles1, osc_last_y[osc], wA, kA);
+  
+  return clk_div;
+}
+
 #ifndef USE_FLOAT_VOICE_TASK
 // Fixed-point realtime voice engine (portamento, modifiers, clkdiv, amp,
 // PIO/PWM/PW). Selected by voice_task_main() when USE_FLOAT_VOICE_TASK is not
@@ -758,7 +758,8 @@ void SRAM_HOT(voice_task_fixed_point)() {
     }
     
       BENCH_BEGIN(vt_range_pwm);
-      voice_write_range_pair(DCO_A, DCO_B, chanLevel, chanLevel2);
+      write_range_pwm(DCO_A, chanLevel);
+      write_range_pwm(DCO_B, chanLevel2);
       BENCH_END(vt_range_pwm);
 
       if (timer99microsFlag2) {
@@ -778,12 +779,7 @@ void SRAM_HOT(voice_task_fixed_point)() {
 
         // 2. ✅ Clean logical sum: Knob + LFO + Envelope + mod_matrix + Jitter 
         int32_t pw_calc = (int32_t)PW[0] + lfo2_delta + adsr3_delta + matrix_pw_mod[i] + (int32_t)character_pw_delta();
-
-        // 3. Clamp to valid 10-bit range (0 .. 1023)
-        if (pw_calc < 0)
-          pw_calc = 0;
-        if (pw_calc > (int32_t)(DIV_COUNTER_PW - 1))
-          pw_calc = (int32_t)(DIV_COUNTER_PW - 1);
+        pw_calc = (pw_calc < 0) ? 0 : ((pw_calc > max_pw) ? max_pw : pw_calc);
 
         PW_PWM[i] = (uint16_t)pw_calc;
         BENCH_FEND(vt_pwm_calc);
@@ -921,6 +917,7 @@ void SRAM_HOT(voice_task_float)() {
   // Character Engine Output
   const float char_pitch_delta_f = char_pitch_scale_q15 ? character_pitch_delta_float() : 0.0f;
   const int32_t char_pw_delta_i = (int32_t)character_pw_delta();
+  const int32_t char_amp_mod_factor  = char_amp_scale_q15   ? character_amp_delta()         : 0;
 
   // ADSR Routing flags (computed once outside the loop to eliminate branch mispredictions)
   const bool adsr_osc1_en = (ADSR3ToOscSelect == 0 || ADSR3ToOscSelect == 2 || ADSR3ToOscSelect == 4);
@@ -934,7 +931,6 @@ void SRAM_HOT(voice_task_float)() {
   const float depth_scaler = 0.00003051757f * 2.5f;     // Combines the division and 2.5 octave scale
   // ----------------------------
 
-  const uint32_t sys_hz = sysClock_Hz;
   const uint8_t sm = syncMode;
   BENCH_END(vt_task_prep);
 
@@ -1169,10 +1165,9 @@ void SRAM_HOT(voice_task_float)() {
 
 
       BENCH_BEGIN(vt_clk_div);
-      const float sys_hz_f = (float)sys_hz;
-
-      uint32_t total_cycles1 = clkdiv_live_total_cycles(sys_hz_f, pio_freqA_Hz);
-      uint32_t total_cycles2 = clkdiv_live_total_cycles(sys_hz_f, pio_freqB_Hz);
+   
+      uint32_t total_cycles1 = clkdiv_live_total_cycles(sysClock_Hz_cached_float, pio_freqA_Hz);
+      uint32_t total_cycles2 = clkdiv_live_total_cycles(sysClock_Hz_cached_float, pio_freqB_Hz);
 
       uint32_t wA, kA, wB, kB;
       get_osc_params(DCO_A, wA, kA);
@@ -1227,14 +1222,18 @@ void SRAM_HOT(voice_task_float)() {
 
       BENCH_BEGIN(vt_range_pwm);
       // Calculate Range levels
-      if (char_amp_scale_q15) {
-        const int32_t amp_j = character_amp_delta();
-        RANGE_PWM[DCO_A] = character_clamp_amp((int32_t)chanLevel + amp_j);
-        RANGE_PWM[DCO_B] = character_clamp_amp((int32_t)chanLevel2 + amp_j);
+      if (char_amp_mod_factor) {
+        // Proportional jitter: ±5% of this specific note's level
+        const int32_t amp_j_A = ((int32_t)chanLevel  * char_amp_mod_factor) >> 15;
+        const int32_t amp_j_B = ((int32_t)chanLevel2 * char_amp_mod_factor) >> 15;
+
+        RANGE_PWM[DCO_A] = character_clamp_amp((int32_t)chanLevel  + amp_j_A);
+        RANGE_PWM[DCO_B] = character_clamp_amp((int32_t)chanLevel2 + amp_j_B);
       } else {
         RANGE_PWM[DCO_A] = chanLevel;
         RANGE_PWM[DCO_B] = chanLevel2;
       }
+      BENCH_END(vt_range_pwm);
       BENCH_END(vt_range_pwm);
 
       PIO pioN_A = pio[VOICE_TO_PIO[DCO_A]];
@@ -1279,8 +1278,15 @@ void SRAM_HOT(voice_task_float)() {
               // This shortens the current ramp to the new note instantly without
               // forcing a hard phase restart.
               // =================================================================
+            #if defined(UPDATE_CLK_DIV_INSTANTLY)
               update_osc_clk_div_instantly(pioN_A, sm1N, DCO_A, clk_div1);
               update_osc_clk_div_instantly(pioN_B, sm2N, DCO_B, clk_div2);
+            #else
+              pio_sm_put(pioN_A, sm1N, clk_div1);
+              pio_sm_put(pioN_B, sm2N, clk_div2);
+              pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
+              pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true));
+            #endif
 
               // // Fallback for when the above doesn't work:
               // pio_sm_put(pioN_A, sm1N, clk_div1);
@@ -1299,14 +1305,15 @@ void SRAM_HOT(voice_task_float)() {
       } else {
           // Normal running frame: update clk_div continuously for vibrato/LFOs
           BENCH_BEGIN(vt_pio_write);
+          #if defined(UPDATE_CLK_DIV_INSTANTLY)
           update_osc_clk_div_instantly(pioN_A, sm1N, DCO_A, clk_div1);
           update_osc_clk_div_instantly(pioN_B, sm2N, DCO_B, clk_div2);
-          // // Fallback for when the above doesn't work:
-          // pio_sm_put(pioN_A, sm1N, clk_div1);
-          // pio_sm_put(pioN_B, sm2N, clk_div2);
-          // pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
-          // pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true)); 
-
+          #else
+          pio_sm_put(pioN_A, sm1N, clk_div1);
+          pio_sm_put(pioN_B, sm2N, clk_div2);
+          pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
+          pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true));
+          #endif
           osc_last_clk_div[DCO_A] = clk_div1;
           osc_last_clk_div[DCO_B] = clk_div2;
           BENCH_END(vt_pio_write);
@@ -1635,7 +1642,8 @@ void SRAM_HOT(voice_task_Q24)() {
       BENCH_END(vt_pio_write);
     }
 
-    voice_write_range_pair(DCO_A, DCO_B, chanLevel, chanLevel2);
+    write_range_pwm(DCO_A, chanLevel);
+    write_range_pwm(DCO_B, chanLevel2);
 
     if (timer99microsFlag2) {
       if (pulseWaveOn) {

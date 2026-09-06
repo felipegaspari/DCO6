@@ -1014,35 +1014,6 @@
           },
           {
             "type": "panel",
-            "id": "cell_cc114_osc_b_tri_enable",
-            "layout": "vertical",
-            "scroll": false,
-            "innerPadding": false,
-            "padding": 4,
-            "css": "grid-row: span 5;",
-            "widgets": [
-              {
-                "type": "switch",
-                "id": "cc114_osc_b_tri_enable",
-                "address": "/control",
-                "preArgs": [
-                  1,
-                  114
-                ],
-                "target": "midi:dco4",
-                "default": 0,
-                "expand": true,
-                "html": "OSC B Tri enable",
-                "css": "> .html { white-space: normal; line-height: 1.15em; font-size: 85%; }",
-                "values": {
-                  "Off ": 0,
-                  "On ": 127
-                }
-              }
-            ]
-          },
-          {
-            "type": "panel",
             "id": "cell_cc115_osc3_saw_enable",
             "layout": "vertical",
             "scroll": false,

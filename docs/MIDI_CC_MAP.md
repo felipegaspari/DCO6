@@ -44,7 +44,6 @@ so CC 0 lands on `CC 0` below and CC 127 on `CC 127`. Envelope attack, decay and
 | 18 | OSC A Tri enable | Oscillators | `PARAM_OSC1_TRI_ENABLE` | 0 | 1 | linear |
 | 112 | OSC B Saw enable | Oscillators | `PARAM_OSC2_SAW_ENABLE` | 0 | 1 | linear |
 | 113 | OSC B Pulse enable | Oscillators | `PARAM_OSC2_PULSE_ENABLE` | 0 | 1 | linear |
-| 114 | OSC B Tri enable | Oscillators | `PARAM_OSC2_TRI_ENABLE` | 0 | 1 | linear |
 | 115 | OSC3 Saw enable | Oscillators | `PARAM_OSC3_SAW_ENABLE` | 0 | 1 | linear |
 | 116 | OSC3 Pulse enable | Oscillators | `PARAM_OSC3_PULSE_ENABLE` | 0 | 1 | linear |
 | 117 | OSC3 Tri enable | Oscillators | `PARAM_OSC3_TRI_ENABLE` | 0 | 1 | linear |

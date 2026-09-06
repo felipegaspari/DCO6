@@ -85,6 +85,9 @@
 #define NOTE_RETRIG_MODE_DEFAULT 0
 #endif
 
+// Uncomment to enable instant PIO divider update (helps not to have note transition clicks, but creates clkdiv x delays and jitter when modulation is too fast)
+#define UPDATE_CLK_DIV_INSTANTLY
+
 // =============================================================================
 // ENGINE — overrides (uncomment to force; after board defaults)
 // =============================================================================
@@ -125,7 +128,7 @@
 // Objects: noise0..1 in noise.h (ctor sets min/max/color/seed); next() in loop1.
 // PIO white: dcoNoisePioBegin / dcoNoisePioRefill (library reads these flags).
 // Bench: parent noise_gens + "noise refill".
-#define NOISE_ENGINE 1
+#define NOISE_ENGINE 2
 // #undef NOISE_ENGINE
 // #define NOISE_ENGINE 0
 // #define NOISE_ENGINE 1
@@ -189,9 +192,9 @@
 
 #ifdef BENCHMARKING_ENABLED
 
-//#define ENABLE_SWD_TELEMETRY
+#define ENABLE_SWD_TELEMETRY
 
-#define RUNNING_AVERAGE
+//#define RUNNING_AVERAGE
 
 #if defined(ENABLE_SWD_TELEMETRY)
   // SWD telemetry enabled, use its specific functions.

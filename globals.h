@@ -38,19 +38,21 @@
 // Cache actual Hz: clock_get_hz is not free — do not put it on the voice hot path.
 // Call sys_clock_hz_refresh() once per core at boot before PIO/clkdiv runs.
 uint32_t sysClock_Hz_cached = F_CPU;
+float sysClock_Hz_cached_float = (float)F_CPU;
 static inline void sys_clock_hz_refresh(void) {
   sysClock_Hz_cached = clock_get_hz(clk_sys);
+  sysClock_Hz_cached_float = (float)sysClock_Hz_cached;
 }
 #define sysClock_Hz (sysClock_Hz_cached)
 #define sysClock    (sysClock_Hz_cached / 1000u)
 
 static constexpr uint16_t DIV_COUNTER = RANGE_PWM_WRAP;
 static_assert(DIV_COUNTER >= 1, "RANGE_PWM_WRAP must be >= 1");
-static constexpr uint16_t DIV_COUNTER_PW = 1024;
+static constexpr uint16_t DIV_COUNTER_PW = PW_PWM_WRAP;
 
 // Reset pulse width in system clock cycles (Y). Runtime-settable via
 // PARAM_DEBUG_COMMAND 160 with value in [200, 50000] (dco_control Calibration).
-uint32_t pioPulseLength = 10000;
+uint32_t pioPulseLength = 12000;
 
 // --- PIO Program Timing Constants ---
 // `jmp x-- lp` executes X+1 times: it jumps while X is non-zero, then spends one
@@ -253,14 +255,11 @@ uint8_t SUB_LEVEL_PWM_CHAN;
 #endif
 
 // Board-specific PW center seeds (fake-seed / bank rebuild defaults).
-static constexpr uint16_t kPwCenterDefault[NUM_PW_CHANNELS] = { 570, 552, 540, 553 };
+static constexpr uint16_t kPwCenterDefault[NUM_PW_CHANNELS] = { DIV_COUNTER_PW / 2 };
 
-uint16_t PW_CENTER[NUM_PW_CHANNELS] = { 570, 552, 540, 553 };
-uint16_t PW_LOW_LIMIT[NUM_PW_CHANNELS] = { 0, 0, 0, 0 };
-uint16_t PW_HIGH_LIMIT[NUM_PW_CHANNELS] = {
-  DIV_COUNTER_PW, DIV_COUNTER_PW, DIV_COUNTER_PW, DIV_COUNTER_PW
-};
-uint16_t PW_LOOKUP[3] = { 0, (DIV_COUNTER_PW / 2) - 1, DIV_COUNTER_PW - 1 };
+uint16_t PW_CENTER[NUM_PW_CHANNELS] = { DIV_COUNTER_PW / 2 };
+uint16_t PW_LOW_LIMIT[NUM_PW_CHANNELS] = { 0 };
+uint16_t PW_HIGH_LIMIT[NUM_PW_CHANNELS] = { DIV_COUNTER_PW };
 uint16_t PW_PWM[NUM_PW_CHANNELS];
 
 // Gate flag: 1 while the key is down, 0 from note-off onwards. The allocator in

@@ -254,14 +254,21 @@ static void SRAM_HOT(apply_param_lfo2_to_osc3_coarse)(int16_t v) {
 #endif
 }
  
- static void SRAM_HOT(apply_param_lfo2_to_pw)(int16_t v) { LFO2toPW = (uint16_t)v; }
+static void SRAM_HOT(apply_param_lfo2_to_pw)(int16_t v) { 
+  // Dynamically scales the input depth to match DIV_COUNTER_PW (normalized against 1024 base)
+  LFO2toPW = (uint16_t)(((uint32_t)v * DIV_COUNTER_PW) / 1024); 
+}
  
  // =============================================================================
  // 3. ANALOG DRIFT, CHARACTER & PULSE WIDTH
  // =============================================================================
  
- static void SRAM_HOT(apply_param_character)(int16_t /*v*/) { /* Character scale hook */ }
- static void SRAM_HOT(apply_param_pw_value) (int16_t v) { PW[0] = (uint16_t)(v >> 2); }
+ static void SRAM_HOT(apply_param_character)(int16_t v) { 
+  character = (uint8_t)constrain(v, 0, 128);
+  character_recompute_scales();
+}
+
+ static void SRAM_HOT(apply_param_pw_value) (int16_t v) { PW[0] = (uint16_t)(v >> 1);}
  
  // =============================================================================
  // 4. ENVELOPE MODULATIONS, CURVES & TRIGGER MODES
@@ -272,8 +279,8 @@ static void SRAM_HOT(apply_param_lfo2_to_osc3_coarse)(int16_t v) {
  }
  
  static void SRAM_HOT(apply_param_adsr3_to_pwm)(int16_t v) {
-   ADSR3toPWM = (int16_t)v - 512;
-   ADSR3toPWM_scale = ADSR3toPWM;
+  ADSR3toPWM = (int16_t)(((int32_t)(v - 512) * (int32_t)DIV_COUNTER_PW) / 1024);
+  ADSR3toPWM_scale = ADSR3toPWM;
  }
  
 /**
@@ -452,7 +459,7 @@ static void SRAM_HOT(apply_param_adsr1_mode)(int16_t v) {
  static void SRAM_HOT(apply_param_cal_pw_center)(int16_t v) {
    uint8_t osc = cal_stage_to_osc_n(manualCalibrationStage, NUM_OSCILLATORS);
    uint8_t ch = osc / 2;
-   if (ch < 4) {
+   if (ch < NUM_PW_CHANNELS) {
      PW_CENTER[ch] = (uint16_t)constrain(v, 0, CAL_PW_CENTER_MAX);
    }
  }
@@ -480,162 +487,173 @@ static void SRAM_HOT(apply_param_adsr1_mode)(int16_t v) {
  // =============================================================================
  
  static void SRAM_HOT(apply_param_debug_command)(int16_t v) {
-   uint8_t hi = (uint8_t)((uint16_t)v >> 8);
-   uint8_t lo = (uint8_t)((uint16_t)v & 0xFF);
-   if (hi == 0xC8) {
-     ampCompJitter = lo;
-     return;
-   }
-   if (hi == 0xCA) {
-     pitchJitter = lo;
-     return;
-   }
-   if (hi == 0xCB) {
-     pulsewidthJitter = lo;
-     return;
-   }
- 
-   if ((uint16_t)v >= 200 && (uint16_t)v <= 50000) {
-     pioPulseLength = (uint16_t)v;
-     pio_defer_request_reset_pulse_all();
-     return;
-   }
- 
-   switch (v) {
-   case 1:
-     pio_topology_report();
-     break;
-   case 2:
-     pio_period_probe(0, 100);
-     break;
-   case 3:
-     pio_period_probe(0, 50000);
-     break;
-     case 5:
-     print_dma_pwm_report();
-     break;
-   case 6:
-     print_mcu_dma_map();
-     break;
- 
- #ifdef RUNNING_AVERAGE
-   case 10:
-     bench_dump_request = true;
-     break;
-   case 11:
-     bench_reset_all();
-     break;
-   case 12:
-     bench_periodic = !bench_periodic;
-     break;
- #endif
- 
- #ifdef ENABLE_MEM_DIAG
-   case 13:
-     mem_diag_request();
-     break;
-   case 14:
-     mem_diag_runtime_enabled = false;
-     break;
-   case 15:
-     mem_diag_runtime_enabled = true;
-     break;
- #endif
- #if defined(USE_FLOAT_AMP_COMP)
- case 20:
-   amp_comp_set_method(AMP_COMP_FLOAT_QUAD);
-   break;
- case 21:
-   amp_comp_set_method(AMP_COMP_LUT);
-   break;
- case 22:
-   amp_comp_set_method(AMP_COMP_FIXED);
-   break;
+  const uint16_t u = (uint16_t)v;
+  const uint8_t hi = (uint8_t)(u >> 8);
+  const uint8_t lo = (uint8_t)(u & 0xFF);
+
+  // 1. Packed Hex Jitter Commands (0xC8xx, 0xCAxx, 0xCBxx)
+  if (hi == 0xC8) {
+    ampCompJitter = (lo > 128) ? 128 : lo;
+    character_recompute_scales();
+    return;
+  }
+  if (hi == 0xCA) {
+    pitchJitter = (lo > 128) ? 128 : lo;
+    character_recompute_scales();
+    return;
+  }
+  if (hi == 0xCB) {
+    pulsewidthJitter = (lo > 128) ? 128 : lo;
+    character_recompute_scales();
+    return;
+  }
+
+  // 2. Hardware Reset Pulse Length (200 .. 50000 cycles)
+  // Check that hi is not one of our reserved command prefixes
+  if (hi < 0xC0 && u >= 200 && u <= 50000) {
+    pioPulseLength = u;
+    pio_defer_request_reset_pulse_all();
+    return;
+  }
+
+  // 3. Discrete Command Dispatch
+  switch (v) {
+    case 1:
+      pio_topology_report();
+      break;
+    case 2:
+      pio_period_probe(0, 100);
+      break;
+    case 3:
+      pio_period_probe(0, 50000);
+      break;
+    case 5:
+      print_dma_pwm_report();
+      break;
+    case 6:
+      print_mcu_dma_map();
+      break;
+
+#ifdef RUNNING_AVERAGE
+    case 10:
+      bench_dump_request = true;
+      break;
+    case 11:
+      bench_reset_all();
+      break;
+    case 12:
+      bench_periodic = !bench_periodic;
+      break;
+#endif
+
+#ifdef ENABLE_MEM_DIAG
+    case 13:
+      mem_diag_request();
+      break;
+    case 14:
+      mem_diag_runtime_enabled = false;
+      break;
+    case 15:
+      mem_diag_runtime_enabled = true;
+      break;
+#endif
+
+#if defined(USE_FLOAT_AMP_COMP)
+    case 20:
+      amp_comp_set_method(AMP_COMP_FLOAT_QUAD);
+      break;
+    case 21:
+      amp_comp_set_method(AMP_COMP_LUT);
+      break;
+    case 22:
+      amp_comp_set_method(AMP_COMP_FIXED);
+      break;
 #endif
 
 #if defined(AMP_COMP_BENCHMARK)
- case 24:
-   amp_comp_bench_speed_pending = true;
-   break;
- case 25:
-   amp_comp_bench_accuracy_pending = true;
-   break;
+    case 24:
+      amp_comp_bench_speed_pending = true;
+      break;
+    case 25:
+      amp_comp_bench_accuracy_pending = true;
+      break;
 #endif
     case 28:
-    pitch_interp_bench_speed_pending = true;
-    break;
+      pitch_interp_bench_speed_pending = true;
+      break;
     case 29:
-    pitch_interp_bench_accuracy_pending = true;
-    break;
-   case 30:
-     seed_fake_calibration_tables(true);
-     break;
-   case 34:
-     autotuneAmpMethod = 0;
-     break;
-   case 35:
-     autotuneAmpMethod = 1;
-     break;
-   case 36:
-     calibrationVerifyRequested = true;
-     break;
-   case 37:
-     autotuneSearchMode = 0;
-     break;
-   case 38:
-     autotuneSearchMode = 1;
-     break;
-   case 39:
-     autotuneSearchMode = 2;
-     break;
-   case 40:
-     autotuneAmp0Mode = 0;
-     break;
-   case 41:
-     autotuneAmp0Mode = 1;
-     break;
-   case 46:
-     pwCvProbeRequested = true;
-     break;
- 
-   case 42:
-   case 43:
-   case 44:
-   case 45:
-     serialSendParam16(PARAM_DEBUG_COMMAND, v);
-     break;
- 
-   case 90:
-     Serial.println("[mcu] Rebooting system...");
-     Serial.flush();
-     delay(30);
- #if defined(PICO_MULTICORE) || defined(ARDUINO_ARCH_RP2040)
-     multicore_reset_core1();
- #endif
- #if defined(ARDUINO_ARCH_RP2040)
-     rp2040.reboot();
- #else
-     watchdog_reboot(0, 0, 0);
- #endif
-     break;
- 
-   case 91:
-     Serial.println("[mcu] Entering BOOTSEL mode...");
-     Serial.flush();
-     delay(30);
- #if defined(PICO_MULTICORE) || defined(ARDUINO_ARCH_RP2040)
-     multicore_reset_core1();
- #endif
- #if defined(ARDUINO_ARCH_RP2040)
-     rp2040.rebootToBootloader();
- #else
-     reset_usb_boot(0, 0);
- #endif
-     break;
-   default:
-     break;
-   }
- }
+      pitch_interp_bench_accuracy_pending = true;
+      break;
+    case 30:
+      seed_fake_calibration_tables(true);
+      break;
+    case 34:
+      autotuneAmpMethod = 0;
+      break;
+    case 35:
+      autotuneAmpMethod = 1;
+      break;
+    case 36:
+      calibrationVerifyRequested = true;
+      break;
+    case 37:
+      autotuneSearchMode = 0;
+      break;
+    case 38:
+      autotuneSearchMode = 1;
+      break;
+    case 39:
+      autotuneSearchMode = 2;
+      break;
+    case 40:
+      autotuneAmp0Mode = 0;
+      break;
+    case 41:
+      autotuneAmp0Mode = 1;
+      break;
+    case 46:
+      pwCvProbeRequested = true;
+      break;
+
+    case 42:
+    case 43:
+    case 44:
+    case 45:
+      serialSendParam16(PARAM_DEBUG_COMMAND, v);
+      break;
+
+    case 90:
+      Serial.println("[mcu] Rebooting system...");
+      Serial.flush();
+      delay(30);
+#if defined(PICO_MULTICORE) || defined(ARDUINO_ARCH_RP2040)
+      multicore_reset_core1();
+#endif
+#if defined(ARDUINO_ARCH_RP2040)
+      rp2040.reboot();
+#else
+      watchdog_reboot(0, 0, 0);
+#endif
+      break;
+
+    case 91:
+      Serial.println("[mcu] Entering BOOTSEL mode...");
+      Serial.flush();
+      delay(30);
+#if defined(PICO_MULTICORE) || defined(ARDUINO_ARCH_RP2040)
+      multicore_reset_core1();
+#endif
+#if defined(ARDUINO_ARCH_RP2040)
+      rp2040.rebootToBootloader();
+#else
+      reset_usb_boot(0, 0);
+#endif
+      break;
+
+    default:
+      break;
+  }
+}
  
  // =============================================================================
  // 7. PRESET STORE, CALIBRATION DUMP & RECALL
@@ -919,8 +937,8 @@ static void SRAM_HOT(apply_param_adsr1_mode)(int16_t v) {
     ADSR3toDETUNE1_scale_q24 = (int32_t)ADSR3toDETUNE1 * 65664;
   #endif
   
-    LFO2toPW          = (uint16_t)presetParamShadow[PARAM_LFO2_TO_PW];
-  
+    LFO2toPW          = (uint16_t)(((uint32_t)presetParamShadow[PARAM_LFO2_TO_PW] * DIV_COUNTER_PW) / 1024);
+
     // =========================================================================
     // 4. Analog Drift, Pulse Width & Character
     // =========================================================================
@@ -929,14 +947,14 @@ static void SRAM_HOT(apply_param_adsr1_mode)(int16_t v) {
     apply_param_analog_drift_spread(presetParamShadow[PARAM_ANALOG_DRIFT_SPREAD]);
     init_DRIFT_LFOs();
   
-    PW[0]             = (uint16_t)(presetParamShadow[PARAM_PW_VALUE] >> 2);
+    PW[0] = presetParamShadow[PARAM_PW_VALUE] >> 1;
   
    // =========================================================================
    // 5. Envelope Modulations, Curves & Filter Trigger Mode
    // =========================================================================
    ADSR3ToOscSelect         = (int8_t)presetParamShadow[PARAM_ADSR3_TO_OSC_SELECT];
-   ADSR3toPWM               = (int16_t)presetParamShadow[PARAM_ADSR3_TO_PWM] - 512;
-   ADSR3toPWM_scale         = ADSR3toPWM;
+   ADSR3toPWM = (int16_t)(((int32_t)(presetParamShadow[PARAM_ADSR3_TO_PWM] - 512) * (int32_t)DIV_COUNTER_PW) / 1024);
+   ADSR3toPWM_scale = ADSR3toPWM;
    ADSR3toDETUNE1           = presetParamShadow[PARAM_ADSR3_TO_DETUNE1];
    ADSR3toDETUNE1_scale_q24 = (int32_t)presetParamShadow[PARAM_ADSR3_TO_DETUNE1] * 65664;
    
