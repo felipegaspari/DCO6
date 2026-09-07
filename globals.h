@@ -112,6 +112,7 @@ volatile uint8_t oscPhaseSync = 0;
 
 // 0 to 32767 (Q15 format)
 volatile int16_t crossmod_depth = 0;
+volatile uint8_t crossmod_mode = 1;
 
 bool pulseWaveOn = false;
 

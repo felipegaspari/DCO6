@@ -119,28 +119,44 @@ volatile float lfo2_pitch_mod_f[LFO2_PITCH_SLOT_COUNT];
 float drift_pitch_scale_f = 0.0f;
 
 float LFO1toDCO_f = 0.0f;
+float LFO1toDCO_comp_f = 0.0f;
 float LFO1toOSC1_f = 0.0f;
+float LFO1toOSC1_comp_f = 0.0f;
 float LFO1toOSC2_f = 0.0f;
+float LFO1toOSC2_comp_f = 0.0f;
 float LFO1toOSC3_f = 0.0f;
+float LFO1toOSC3_comp_f = 0.0f;
 
 float LFO2toOSC2_f = 0.0f;
+float LFO2toOSC2_comp_f = 0.0f;
 float LFO2toOSC3_f = 0.0f;
+float LFO2toOSC3_comp_f = 0.0f;
 float LFO2toOSC2_coarse_f = 0.0f;
+float LFO2toOSC2_coarse_comp_f = 0.0f;
 float LFO2toOSC3_coarse_f = 0.0f;
+float LFO2toOSC3_coarse_comp_f = 0.0f;
 #else
 volatile int32_t lfo1_pitch_mod_q24[LFO1_PITCH_SLOT_COUNT];
 volatile int32_t lfo2_pitch_mod_q24[LFO2_PITCH_SLOT_COUNT];
 int32_t drift_pitch_scale_q24 = 0;
 
 int32_t LFO1toDCO_q24 = 0;
+int32_t LFO1toDCO_comp_q24 = 0;
 int32_t LFO1toOSC1_q24 = 0;
+int32_t LFO1toOSC1_comp_q24 = 0;
 int32_t LFO1toOSC2_q24 = 0;
+int32_t LFO1toOSC2_comp_q24 = 0;
 int32_t LFO1toOSC3_q24 = 0;
+int32_t LFO1toOSC3_comp_q24 = 0;
 
 int32_t LFO2toOSC2_q24 = 0;
+int32_t LFO2toOSC2_comp_q24 = 0;
 int32_t LFO2toOSC3_q24 = 0;
+int32_t LFO2toOSC3_comp_q24 = 0;
 int32_t LFO2toOSC2_coarse_q24 = 0;
+int32_t LFO2toOSC2_coarse_comp_q24 = 0;
 int32_t LFO2toOSC3_coarse_q24 = 0;
+int32_t LFO2toOSC3_coarse_comp_q24 = 0;
 #endif
 
 volatile int16_t LFO1Level;

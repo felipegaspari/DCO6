@@ -165,6 +165,7 @@ These parameters take discrete values; the CC number to send is the value itself
 These parameters stay panel/serial only:
 
 - **Crossmod depth** (parameter 130)
+- **Crossmod mode** (parameter 131)
 - **EnvVCA mode** (parameter 224)
 - **EnvVCF mode** (parameter 225)
 - **EnvDCO mode** (parameter 223)
