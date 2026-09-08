@@ -164,6 +164,8 @@ These parameters take discrete values; the CC number to send is the value itself
 
 These parameters stay panel/serial only:
 
+- **OSC1 detune** (parameter 132)
+- **Master detune** (parameter 133)
 - **Crossmod depth** (parameter 130)
 - **Crossmod mode** (parameter 131)
 - **EnvVCA mode** (parameter 224)

@@ -28,6 +28,8 @@
  static void SRAM_HOT(apply_param_osc1_interval)(int16_t v) { octave_shift = (int8_t)v; }
  static void SRAM_HOT(apply_param_osc2_interval)(int16_t v) { OSC2_interval = (int8_t)v; }
  static void SRAM_HOT(apply_param_osc3_interval)(int16_t v) { OSC3_interval = (int8_t)v; }
+ static void SRAM_HOT(apply_param_master_tuning)(int16_t v) { masterTuning = (uint16_t)v; }
+ static void SRAM_HOT(apply_param_osc1_detune)(int16_t v) { OSC1_detune = (uint16_t)v; }
  static void SRAM_HOT(apply_param_osc2_detune)(int16_t v) { OSC2_detune = (uint16_t)v; }
  static void SRAM_HOT(apply_param_osc3_detune)(int16_t /*v*/) { /* DCO3 monosynth only */ }
  static void SRAM_HOT(apply_param_unison_detune)(int16_t v) { unisonDetune = v; }
@@ -141,7 +143,7 @@ static void SRAM_HOT(apply_param_soft_sync)(int16_t v) {
 }
 
 static void SRAM_HOT(apply_param_crossmod_depth)(int16_t v) {
-  crossmod_depth = (int16_t)v;
+  crossmod_depth = (uint16_t)v;
   update_crossmod_prebake(crossmod_depth);
 }
 
@@ -687,10 +689,12 @@ static void SRAM_HOT(apply_param_adsr1_mode)(int16_t v) {
  
  /** @brief Master descriptor table binding Parameter IDs to applier functions. */
  static const ParamDescriptorT<int16_t> paramTable[] = {
+     {PARAM_MASTER_TUNING, apply_param_master_tuning},
      {PARAM_OSC1_PULSE_ENABLE, apply_param_osc1_pulse_enable},
      {PARAM_OSC1_INTERVAL, apply_param_osc1_interval},
      {PARAM_OSC2_INTERVAL, apply_param_osc2_interval},
      {PARAM_OSC3_INTERVAL, apply_param_osc3_interval},
+     {PARAM_OSC1_DETUNE_VAL, apply_param_osc1_detune},
      {PARAM_OSC2_DETUNE_VAL, apply_param_osc2_detune},
      {PARAM_OSC3_DETUNE_VAL, apply_param_osc3_detune},
      {PARAM_UNISON_DETUNE, apply_param_unison_detune},
@@ -877,8 +881,10 @@ static void SRAM_HOT(apply_param_adsr1_mode)(int16_t v) {
     octave_shift      = (int8_t)presetParamShadow[PARAM_OSC1_INTERVAL];
     OSC2_interval     = (int8_t)presetParamShadow[PARAM_OSC2_INTERVAL];
     OSC3_interval     = (int8_t)presetParamShadow[PARAM_OSC3_INTERVAL];
+    OSC1_detune       = (uint16_t)presetParamShadow[PARAM_OSC1_DETUNE_VAL];
     OSC2_detune       = (uint16_t)presetParamShadow[PARAM_OSC2_DETUNE_VAL];
     unisonDetune      = presetParamShadow[PARAM_UNISON_DETUNE];
+    masterTuning      = (uint16_t)presetParamShadow[PARAM_MASTER_TUNING];
   
     apply_param_portamento_time((uint16_t)presetParamShadow[PARAM_PORTAMENTO_TIME]);
     portamento_mode   = (uint8_t)presetParamShadow[PARAM_PORTAMENTO_MODE];
@@ -892,7 +898,7 @@ static void SRAM_HOT(apply_param_adsr1_mode)(int16_t v) {
     setSyncMode();
     apply_param_phase_align((int16_t)presetParamShadow[PARAM_OSC_PHASE_SYNC]);
     subOscDivide      = (uint8_t)presetParamShadow[PARAM_SUBOSC_DIVIDE];
-    crossmod_depth    = (int16_t)presetParamShadow[PARAM_CROSSMOD_DEPTH];
+    crossmod_depth    = (uint16_t)presetParamShadow[PARAM_CROSSMOD_DEPTH];
     crossmod_mode      = (uint8_t)presetParamShadow[PARAM_CROSSMOD_MODE];
     update_crossmod_prebake(crossmod_depth);
   

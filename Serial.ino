@@ -97,10 +97,12 @@ void __not_in_flash_func(serial_send_patch_osc_block_to_mb)() {
   if (presetParamShadow[PARAM_OSC3_PULSE_ENABLE]) waves |= (1u << 7);
   if (presetParamShadow[PARAM_OSC3_TRI_ENABLE])   waves |= (1u << 8);
   blk.wave_enables = waves;
-
+  
+  blk.master_tuning       = (uint16_t)presetParamShadow[PARAM_MASTER_TUNING];
   blk.osc1_interval       = (int8_t)presetParamShadow[PARAM_OSC1_INTERVAL];
   blk.osc2_interval       = (int8_t)presetParamShadow[PARAM_OSC2_INTERVAL];
   blk.osc3_interval       = (int8_t)presetParamShadow[PARAM_OSC3_INTERVAL];
+  blk.osc1_detune         = (uint16_t)presetParamShadow[PARAM_OSC1_DETUNE_VAL];
   blk.osc2_detune         = (uint16_t)presetParamShadow[PARAM_OSC2_DETUNE_VAL];
   blk.osc3_detune         = (uint16_t)presetParamShadow[PARAM_OSC3_DETUNE_VAL];
   blk.unison_detune       = (int16_t)presetParamShadow[PARAM_UNISON_DETUNE];
@@ -116,7 +118,7 @@ void __not_in_flash_func(serial_send_patch_osc_block_to_mb)() {
   blk.portamento_time     = (uint16_t)presetParamShadow[PARAM_PORTAMENTO_TIME];
   blk.portamento_mode     = (uint8_t)presetParamShadow[PARAM_PORTAMENTO_MODE];
   blk.character           = (uint8_t)presetParamShadow[PARAM_CHARACTER];
-  blk.crossmod_depth      = (int16_t)presetParamShadow[PARAM_CROSSMOD_DEPTH];
+  blk.crossmod_depth      = (uint16_t)presetParamShadow[PARAM_CROSSMOD_DEPTH];
   blk.crossmod_mode       = (uint8_t)presetParamShadow[PARAM_CROSSMOD_MODE];
 
   serial_frame_write(Serial2Dma, CMD_BLOCK_OSC, (const uint8_t*)&blk, SERIAL_LEN_BLOCK_OSC);

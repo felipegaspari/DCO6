@@ -182,13 +182,13 @@
 
 #ifdef BENCHMARKING_ENABLED
 
-#define ENABLE_SWD_TELEMETRY
+//#define ENABLE_SWD_TELEMETRY
 
-//#define RUNNING_AVERAGE
+#define RUNNING_AVERAGE
 
 #if defined(ENABLE_SWD_TELEMETRY)
   // SWD telemetry enabled, use its specific functions.
-  //#define ENABLE_SWD_PERIOD 
+  #define ENABLE_SWD_PERIOD 
 
 #elif defined(RUNNING_AVERAGE)
   // Basic running average sampling enabled.

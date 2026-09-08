@@ -420,9 +420,12 @@ void SRAM_HOT(voice_task_Q24)() {
 
   last_midi_pitch_bend = midi_pitch_bend;
 
-  // OSC2 Detune (kept as float because it is a direct Hz output scaler)
-  const float detuneSteps = (float)((int32_t)OSC2_detune - 256);
-  const float osc2DetuneRatio = 1.0f + 0.0002f * detuneSteps;
+  // OSC Detune (kept as float because it is a direct Hz output scaler)
+  const float osc1DetuneSteps = (float)((int32_t)OSC1_detune - 256);
+  const float osc1DetuneRatio = 1.0f + 0.0002f * osc1DetuneSteps;
+
+  const float osc2DetuneSteps = (float)((int32_t)OSC2_detune - 256);
+  const float osc2DetuneRatio = 1.0f + 0.0002f * osc2DetuneSteps;
 
   // Unison Base - Native Q24
   static constexpr int32_t UNISON_SCALE_Q24 = (int32_t)(0.0001f * (float)(1 << 24) + 0.5f);

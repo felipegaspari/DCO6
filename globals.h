@@ -111,7 +111,7 @@ volatile uint8_t oscPhaseSync = 0;
 
 
 // 0 to 32767 (Q15 format)
-volatile int16_t crossmod_depth = 0;
+uint16_t crossmod_depth = 0;
 volatile uint8_t crossmod_mode = 1;
 
 bool pulseWaveOn = false;
@@ -349,7 +349,8 @@ uint8_t OSC2_serial_detune = 127;
 volatile uint8_t OSC2_interval = 36;
 volatile uint8_t OSC3_interval = 36;
 
-
+uint16_t masterTuning = 0;
+uint16_t OSC1_detune = 127;
 uint16_t OSC2_detune = 127;
 uint16_t OSC3_detune = 127;
 

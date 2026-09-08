@@ -337,94 +337,103 @@ static constexpr uint32_t PIO_INSTR_MOV_X_OSR = 0xa027;
 // =============================================================================
 // HEAVILY OPTIMIZED INSTANT PIO DIVIDER UPDATE (250 MHz / 10 µs Loop1)
 // =============================================================================
-// static constexpr int32_t BUS_LATENCY_CYCLES = 28;  ///<
-// static constexpr int32_t SAFEGUARD_CYCLES   = 150;  ///< ~16000 ns threshold at 250 MHz
+// -----------------------------------------------------------------------------
+// HARDWARE LATENCY DOMAINS
+// -----------------------------------------------------------------------------
+// In the ultra-optimized version, snapshot-to-swap takes ~22 CPU cycles.
+static constexpr float BASE_PIPELINE_LATENCY = 22.0f; 
 
+// TUNING CALIBRATION TRIM:
+// If pitch goes SHARP under extreme modulation -> DECREASE this value (e.g. -2.0f, -4.0f)
+// If pitch goes FLAT under extreme modulation  -> INCREASE this value (e.g. +2.0f, +4.0f)
+static constexpr float LATENCY_CALIBRATION_TRIM = 16.0f; 
 
-// UNTESTED VERSION
+// Combined pre-scale latency applied in the OLD frequency domain
+static constexpr float TOTAL_PRE_SCALE_LATENCY = BASE_PIPELINE_LATENCY + LATENCY_CALIBRATION_TRIM;
 
-static constexpr float MANUAL_LATENCY_VALUE = 15.0f; 
-
-// CALIBRATED: Real APB bus round-trip (RXF read stall + VFP math + APB writes)
-// Measured snapshot-to-swap hardware latency = 52 cycles (~208 ns @ 250 MHz).
-static constexpr int32_t PIPELINE_LATENCY_CYCLES = 52;
-
-// CALIBRATED: Only 2 instructions injected before X is updated (PULL + MOV_X_OSR).
+// Post-swap PIO hardware stalls: PULL (1) + MOV_X_OSR (1) = 2 cycles
 static constexpr int32_t PRE_SWAP_STALL_CYCLES = 2;
+static constexpr float   ROUND_STALL_OFFSET    = -1.5f; // (+0.5f round - 2.0f stall)
 
-// CALIBRATED: 120 cycles (480 ns). Any remaining time less than this safely falls
-// back to the natural cycle boundary, completely preventing zero-crossing pops.
-static constexpr int32_t SAFEGUARD_CYCLES = 120;
+// Safety thresholds
+static constexpr int32_t SAFEGUARD_CYCLES      = 120;
+static constexpr int32_t MIN_NEW_X_CYCLES      = 36;
+// Maximum voice allocation (scale to your actual synth voice count)
+static constexpr size_t  MAX_SYNTH_OSCS          = NUM_OSCILLATORS; 
 
-// CALIBRATED: Minimum duration for new_x to avoid immediate underflow.
-static constexpr int32_t MIN_NEW_X_CYCLES = 36;
+// Packed 16-byte cache-aligned state for single-cycle LDRD/STRD instructions
+struct alignas(16) OscState {
+    uint32_t last_div;    ///< Previous clock divider
+    float    inv_div;     ///< 1.0f / last_div (converts VDIV to 1-cycle VMUL)
+    float    frac_carry;  ///< Sub-cycle fractional phase carry
+};
 
-// Global array: avoids C++ function-local static guard variable checks
-static float osc_frac_carry[256] = {0.0f};
+// Placed in fast SRAM (.time_critical / .scratch_y)
+static OscState osc_state[MAX_SYNTH_OSCS] __attribute__((section(".scratch_y")));
 
-static inline void SRAM_HOT(update_osc_clk_div_instantly)(PIO pio, uint sm, uint8_t osc, uint32_t new_div, uint8_t mode = 0) {
-    const uint32_t old_div = osc_last_clk_div[osc];
+static inline void SRAM_HOT(update_osc_clk_div_instantly)(PIO pio, uint sm, uint8_t osc, uint32_t new_div) {
+    OscState* const __restrict st = &osc_state[osc];
+    const uint32_t old_div = st->last_div;
 
-    // 1. Quick exit if pitch hasn't changed
+    // 1. Pitch unchanged: zero cycles stolen, perfect pitch stability
     if (__builtin_expect(old_div == new_div, 1)) return;
 
-    io_rw_32*       const txf   = &pio->txf[sm];
-    pio_sm_hw_t*    const sm_hw = &pio->sm[sm];
+    io_rw_32*    const txf   = &pio->txf[sm];
+    pio_sm_hw_t* const sm_hw = &pio->sm[sm];
 
-    // 2. Uninitialized oscillator startup
+    // 2. Uninitialized startup
     if (__builtin_expect(old_div == 0, 0)) {
-        osc_last_clk_div[osc] = new_div;
+        st->last_div   = new_div;
+        st->inv_div    = 1.0f / (float)new_div;
+        st->frac_carry = 0.0f;
         *txf = new_div;
         sm_hw->instr = PIO_INSTR_PULL;
         return;
     }
 
-    // 3. Pre-calculate ratio outside the snapshot critical path
-    const float ratio = (float)new_div / (float)old_div;
+    // 3. Ratio pre-calculated via reciprocal multiply (1 cycle)
+    const float ratio = (float)new_div * st->inv_div;
 
-    // 4. Snapshot current countdown (X register)
-    sm_hw->instr = PIO_INSTR_IN_X_32;  // PIO stalls 1 cycle
-    sm_hw->instr = PIO_INSTR_PUSH;     // Push snapshot to RX FIFO
-    const int32_t current_x = (int32_t)pio->rxf[sm]; // APB read stall (~14 cycles)
+    // 4. Snapshot current countdown
+    sm_hw->instr = PIO_INSTR_IN_X_32;
+    sm_hw->instr = PIO_INSTR_PUSH;
+    const int32_t current_x = (int32_t)pio->rxf[sm];
 
-    // 5. Check if safe margin exists before the waveform wraps
+    // 5. Safeguard check
     if (__builtin_expect(current_x > SAFEGUARD_CYCLES, 1)) {
         
-        // Exact hardware compensation for real APB bus + CPU transit time
-        const int32_t eff_x = current_x - PIPELINE_LATENCY_CYCLES;
+        // PRE-SCALE COMPENSATION:
+        // Subtracted in float to maintain fractional cycle precision across updates!
+        const float eff_x = (float)current_x - TOTAL_PRE_SCALE_LATENCY;
 
-        if (__builtin_expect(eff_x > 0, 1)) {
-            const float exact_x = ((float)eff_x * ratio) + osc_frac_carry[osc];
-            const int32_t new_x = (int32_t)(exact_x + 0.5f) - PRE_SWAP_STALL_CYCLES;
+        // Sub-cycle phase tracking
+        const float exact_x = (eff_x * ratio) + st->frac_carry;
+        const int32_t new_x = (int32_t)(exact_x + ROUND_STALL_OFFSET);
 
-            if (__builtin_expect(new_x > MIN_NEW_X_CYCLES, 1)) {
-                // --- CRITICAL PATH: Push ONLY new_x and swap immediately ---
-                *txf = (uint32_t)new_x;
-                sm_hw->instr = PIO_INSTR_PULL;       // OSR = new_x
-                sm_hw->instr = PIO_INSTR_MOV_X_OSR;  // X = new_x (SWAP COMPLETE)
-                __dmb();
+        if (__builtin_expect(new_x > MIN_NEW_X_CYCLES, 1)) {
+            // --- CRITICAL PATH: Push ONLY new_x and swap immediately ---
+            *txf = (uint32_t)new_x;
+            sm_hw->instr = PIO_INSTR_PULL;       // OSR = new_x
+            sm_hw->instr = PIO_INSTR_MOV_X_OSR;  // X = new_x (SWAP COMPLETE)
 
-                // --- POST-CRITICAL PATH: Queue new_div for the next natural cycle ---
-                // X is now counting down from new_x (> 36 cycles), so we have plenty
-                // of time to reload OSR before X reaches 0.
-                *txf = new_div;
-                sm_hw->instr = PIO_INSTR_PULL;       // OSR = new_div
-                __dmb();
+            // --- POST-CRITICAL PATH: Queue new_div for next period ---
+            *txf = new_div;
+            sm_hw->instr = PIO_INSTR_PULL;       // OSR = new_div
 
-                // Sub-cycle phase error carry
-                osc_frac_carry[osc] = exact_x - (float)(new_x + PRE_SWAP_STALL_CYCLES);
-                osc_last_clk_div[osc] = new_div;
-                return;
-            }
+            // Update sub-cycle fractional carry
+            st->frac_carry = exact_x - (float)(new_x + PRE_SWAP_STALL_CYCLES);
+            st->last_div   = new_div;
+            st->inv_div    = 1.0f / (float)new_div;
+            return;
         }
     }
 
-    // Fallback: Safe cycle-boundary update (completely artifact-free)
+    // Fallback: Safe cycle-boundary update
     *txf = new_div;
     sm_hw->instr = PIO_INSTR_PULL;
-    osc_last_clk_div[osc] = new_div;
+    st->last_div = new_div;
+    st->inv_div  = 1.0f / (float)new_div;
 }
-
 // 50% version
 // static inline void SRAM_HOT(update_osc_clk_div_instantly)(PIO pio, uint sm, uint8_t osc, uint32_t new_div, bool force_instant = false) {
 //   const uint32_t old_div = osc_last_clk_div[osc];
@@ -598,8 +607,9 @@ void SRAM_HOT(voice_task_float)() {
   // =========================================================================
   // OPTIMIZATION 2: Bypass SDK 64-bit Timer
   // timer_hw->timelr reads the 32-bit hardware microsecond counter directly in 1 cycle.
+  // We capture this once and reuse it across the entire task (including portamento).
   // =========================================================================
-  uint32_t now_us_task = timer_hw->timelr;
+  const uint32_t now_us_task = timer_hw->timelr;
   
   // Natively handles timer wrap-around safely because of unsigned 32-bit math
   uint32_t dt_us = now_us_task - last_task_us;
@@ -629,35 +639,52 @@ void SRAM_HOT(voice_task_float)() {
 
 
   BENCH_BEGIN(vt_pitchbend);
+  // OPTIMIZATION: Pitchbend calculation caching
+  // Only recalculate floating-point scaling when MIDI pitch bend actually changes.
   static constexpr float INV_8192 = 1.0f / 8192.0f;
-  float calcPitchbend = ((float)midi_pitch_bend - 8192.0f) * INV_8192 * pitchBendMultiplier;
-  last_midi_pitch_bend = midi_pitch_bend;
+  static int32_t s_last_midi_pb = -1;
+  static float   s_cached_pitchbend = 0.0f;
+
+  const int32_t cur_midi_pb = (int32_t)midi_pitch_bend;
+  if (__builtin_expect(cur_midi_pb != s_last_midi_pb, 0)) {
+      s_last_midi_pb = cur_midi_pb;
+      s_cached_pitchbend = ((float)cur_midi_pb - 8192.0f) * INV_8192 * pitchBendMultiplier;
+  }
+  const float calcPitchbend = s_cached_pitchbend;
+  last_midi_pitch_bend = cur_midi_pb;
   BENCH_END(vt_pitchbend);
 
 
   BENCH_BEGIN(vt_task_prep);
   // =========================================================================
   // OPTIMIZATION PILLAR II: Register Hoisting & Restrict Pointers
-  // Corrected with explicit 'volatile' qualifiers and exact underlying types.
+  // Corrected: Uses 'const volatile float*' to match multicore definitions in
+  // mod_matrix_engine.h while retaining __restrict.
   // =========================================================================
-  const volatile uint8_t* __restrict vn_osc1 = VOICE_NOTE_OSC1;
-  const volatile uint8_t* __restrict vn_osc2 = VOICE_NOTE_OSC2;
-  const volatile float* __restrict m_pitch_f = matrix_pitch_mod_f;
-  const volatile float* __restrict m_osc1_f  = matrix_osc1_pitch_mod_f;
-  const volatile float* __restrict m_osc2_f  = matrix_osc2_pitch_mod_f;
-  const int32_t* __restrict m_pw   = (const int32_t*)matrix_pw_mod;
-  const int32_t* __restrict m_xmod = (const int32_t*)matrix_xmod_mod;
-  const int16_t* __restrict adsr3_lvl = ADSR3Level_q15;
-  volatile uint8_t* __restrict n_on_flag = note_on_flag;
-  volatile bool* __restrict n_on_flag_f = note_on_flag_flag;
+  const volatile uint8_t*         __restrict vn_osc1    = VOICE_NOTE_OSC1;
+  const volatile uint8_t*         __restrict vn_osc2    = VOICE_NOTE_OSC2;
+  const volatile float*  __restrict m_pitch_f  = matrix_pitch_mod_f;
+  const volatile float*  __restrict m_osc1_f   = matrix_osc1_pitch_mod_f;
+  const volatile float*  __restrict m_osc2_f   = matrix_osc2_pitch_mod_f;
+  const int32_t*         __restrict m_pw       = (const int32_t*)matrix_pw_mod;
+  const int32_t*         __restrict m_xmod     = (const int32_t*)matrix_xmod_mod;
+  const int16_t*         __restrict adsr3_lvl  = ADSR3Level_q15;
+  volatile uint8_t*      __restrict n_on_flag  = note_on_flag;
+  volatile bool*         __restrict n_on_flag_f = note_on_flag_flag;
 
-  // 1. OSC2 Detune
-  const float detuneSteps = (float)((int32_t)OSC2_detune - 256);
-  const float osc2DetuneRatio = 1.0f + 0.0002f * detuneSteps;
+  // 1. OSC Detune
+  const float osc1DetuneSteps = (float)((int32_t)OSC1_detune - 256);
+  const float osc1DetuneRatio = 1.0f + 0.0002f * osc1DetuneSteps;
+  const float osc2DetuneSteps = (float)((int32_t)OSC2_detune - 256);
+  const float osc2DetuneRatio = 1.0f + 0.0002f * osc2DetuneSteps;
 
-  // 2. Unison Base
+  // 2. Unison Base & Precalculated Weights (Scalable up to 16 voices)
   static constexpr float UNISON_SCALE = 0.0001f;
   const float unisonBase = (float)unisonDetune * UNISON_SCALE;
+  static constexpr float UNISON_VOICE_WEIGHTS[16] = {
+      1.0f, -1.0f, 2.0f, -2.0f, 3.0f, -3.0f, 4.0f, -4.0f,
+      5.0f, -5.0f, 6.0f, -6.0f, 7.0f, -7.0f, 8.0f, -8.0f
+  };
 
   // 3. Global LFOs
   const float lfo1_osc1_f = lfo1_pitch_mod_f[LFO1_PITCH_OSC1];
@@ -667,7 +694,7 @@ void SRAM_HOT(voice_task_float)() {
   // 4. Constant Epsilon
   static constexpr float EPS_FLOAT = (float)Q24_ONE_EPS * (1.0f / 16777216.0f);
 
-  // 5. Global PWM LFO delta
+  // 5. Global PWM LFO delta & Base PWM Pre-calculation
   const int32_t lfo2_pw_delta = ((int32_t)LFO2Level * (int32_t)LFO2toPW) >> 15;
 
   // Character Engine Output
@@ -675,13 +702,17 @@ void SRAM_HOT(voice_task_float)() {
   const int32_t char_pw_delta_i = (int32_t)character_pw_delta();
   const int32_t char_amp_mod_factor  = char_amp_scale_q15   ? character_amp_delta()         : 0;
 
+  // Hoist loop-invariant additions out of the voice loop
+  const float global_mods = calcPitchbend + EPS_FLOAT + char_pitch_delta_f;
+  const int32_t base_pw_val = (int32_t)PW[0] + lfo2_pw_delta + char_pw_delta_i;
+
   // ADSR Routing flags (computed once outside the loop to eliminate branch mispredictions)
   const bool adsr_osc1_en = (ADSR3ToOscSelect == 0 || ADSR3ToOscSelect == 2 || ADSR3ToOscSelect == 4);
   const bool adsr_osc2_en = (ADSR3ToOscSelect == 1 || ADSR3ToOscSelect == 2 || ADSR3ToOscSelect == 4);
 
   //  --- XMOD  ----
-  // Pre-calculate loop constants
-  const float hz_to_phase_inc = dt_sec * 4294967296.0f; // Multiplier to map Hz to Q32 Phase
+  // Pre-calculate loop constants (folded 0.000001f * 4294967296.0f)
+  const float hz_to_phase_inc = (float)dt_us * 4294.967296f; // Multiplier to map Hz to Q32 Phase
   // ----------------------------
 
   const uint8_t sm = syncMode;
@@ -690,18 +721,21 @@ void SRAM_HOT(voice_task_float)() {
   // =========================================================================
   // OPTIMIZATION PILLAR VI: Loop Unrolling
   // Amortize SUBS/BNE branch overhead on short loops running 4-16 iterations.
+  // With NUM_VOICES=4, this completely collapses loop branch overhead.
   // =========================================================================
   _Pragma("GCC unroll 4")
   for (int i = 0; i < NUM_VOICES; ++i) {
 
     BENCH_BEGIN(vt_loop_prep);
       
-    // OPTIMIZATION 1: "Load-Acquire" Atomic Exchange
-    // Replaces __dmb() entirely! This executes a 1-cycle ARMv8-M atomic 
-    // instruction that guarantees memory sync specifically for this flag 
-    // WITHOUT halting the entire system bus. __builtin_expect guarantees 
-    // the compiler optimizes the I-Cache for the 99% case where no note is pressed.
-    const bool is_note_on = (__atomic_exchange_n(&n_on_flag[i], 0, __ATOMIC_ACQUIRE) == 1);
+    // OPTIMIZATION 1: Multicore Safe "Load-Acquire" Atomic Exchange
+    // Double-checked acquire: standard 1-cycle LDRB check first to avoid locking 
+    // the system bus fabric when no note is pressed, but guarantees atomic
+    // synchronization when Core 0 triggers a note-on event.
+    bool is_note_on = false;
+    if (__builtin_expect(n_on_flag[i] != 0, 0)) {
+        is_note_on = (__atomic_exchange_n(&n_on_flag[i], 0, __ATOMIC_ACQUIRE) == 1);
+    }
 
     #if DCO_DEBUG_REPORT
     float dbg_freq_base_Hz = 0.0f;
@@ -722,8 +756,8 @@ void SRAM_HOT(voice_task_float)() {
     lastNote1[i] = note1;
     lastNote2[i] = note2;
 
-    float noteFreq1 = sNotePitches[note1];
-    float noteFreq2 = sNotePitches[note2];
+    const float noteFreq1 = sNotePitches[note1];
+    const float noteFreq2 = sNotePitches[note2];
     float freqA, freqB;
 
     // OPTIMIZATION 4: Single-cycle bitwise math
@@ -734,169 +768,170 @@ void SRAM_HOT(voice_task_float)() {
     BENCH_END(vt_loop_prep);
 
 
-      BENCH_BEGIN(vt_portamento);
-      if (portaTime > 0) {
-          uint32_t now_us = micros();
-          portamentoTimer[i] = now_us - portamentoStartMicros[i];
+    BENCH_BEGIN(vt_portamento);
+    if (portaTime > 0) {
+        // Reused now_us_task: Eliminates blocking APB bus read of timer_hw per voice
+        const uint32_t now_us = now_us_task;
+        portamentoTimer[i] = now_us - portamentoStartMicros[i];
 
-          if (is_note_on) {
-              portamentoStartMicros[i] = now_us;
-              portamentoTimer[i] = 0;
+        if (is_note_on) {
+            portamentoStartMicros[i] = now_us;
+            portamentoTimer[i] = 0;
 
-              float targetNoteA = (float)note1;
-              float targetNoteB = (float)note2;
-              porta_setup_glide_f(DCO_A, porta_resolve_start_note_f(DCO_A, targetNoteA), targetNoteA, portaMode);
-              porta_setup_glide_f(DCO_B, porta_resolve_start_note_f(DCO_B, targetNoteB), targetNoteB, portaMode);
-          }
+            float targetNoteA = (float)note1;
+            float targetNoteB = (float)note2;
+            porta_setup_glide_f(DCO_A, porta_resolve_start_note_f(DCO_A, targetNoteA), targetNoteA, portaMode);
+            porta_setup_glide_f(DCO_B, porta_resolve_start_note_f(DCO_B, targetNoteB), targetNoteB, portaMode);
+        }
 
-          const bool portaDoRetime = (portaTimeChanged || portaModeChanged || pitchTargetChanged) && !is_note_on;
+        const bool portaDoRetime = (portaTimeChanged || portaModeChanged || pitchTargetChanged) && !is_note_on;
 
-          float curA, curB;
-          if (portaDoRetime) {
-              portamentoStartMicros[i] = now_us;
-              portamentoTimer[i] = 0;
+        float curA, curB;
+        if (portaDoRetime) {
+            portamentoStartMicros[i] = now_us;
+            portamentoTimer[i] = 0;
 
-              porta_setup_glide_f(DCO_A, porta_note_cur_f[DCO_A], (float)note1, portaMode);
-              porta_setup_glide_f(DCO_B, porta_note_cur_f[DCO_B], (float)note2, portaMode);
-              curA = porta_freq_cur_f[DCO_A];
-              curB = porta_freq_cur_f[DCO_B];
-          } else if (porta_note_cur_f[DCO_A] == porta_note_stop_f[DCO_A] &&
-              porta_note_cur_f[DCO_B] == porta_note_stop_f[DCO_B]) {
-              curA = porta_freq_stop_f[DCO_A];
-              curB = porta_freq_stop_f[DCO_B];
-          } else {
-              int32_t elapsed = (int32_t)portamentoTimer[i];
+            porta_setup_glide_f(DCO_A, porta_note_cur_f[DCO_A], (float)note1, portaMode);
+            porta_setup_glide_f(DCO_B, porta_note_cur_f[DCO_B], (float)note2, portaMode);
+            curA = porta_freq_cur_f[DCO_A];
+            curB = porta_freq_cur_f[DCO_B];
+        } else if (porta_note_cur_f[DCO_A] == porta_note_stop_f[DCO_A] &&
+                   porta_note_cur_f[DCO_B] == porta_note_stop_f[DCO_B]) {
+            curA = porta_freq_stop_f[DCO_A];
+            curB = porta_freq_stop_f[DCO_B];
+        } else {
+            int32_t elapsed = (int32_t)portamentoTimer[i];
 
-              float startNoteA = porta_note_start_f[DCO_A];
-              float startNoteB = porta_note_start_f[DCO_B];
-              float stopNoteA = porta_note_stop_f[DCO_A];
-              float stopNoteB = porta_note_stop_f[DCO_B];
+            float startNoteA = porta_note_start_f[DCO_A];
+            float startNoteB = porta_note_start_f[DCO_B];
+            float stopNoteA = porta_note_stop_f[DCO_A];
+            float stopNoteB = porta_note_stop_f[DCO_B];
 
-              float dNoteA = stopNoteA - startNoteA;
-              float dNoteB = stopNoteB - startNoteB;
+            float dNoteA = stopNoteA - startNoteA;
+            float dNoteB = stopNoteB - startNoteB;
 
-              float curNoteA = startNoteA + porta_note_step_f[DCO_A] * (float)elapsed;
-              float curNoteB = startNoteB + porta_note_step_f[DCO_B] * (float)elapsed;
+            float curNoteA = startNoteA + porta_note_step_f[DCO_A] * (float)elapsed;
+            float curNoteB = startNoteB + porta_note_step_f[DCO_B] * (float)elapsed;
 
-              // =========================================================================
-              // OPTIMIZATION PILLAR I: Branchless Conditional Moves
-              // Nested ternary operators map directly to hardware IT (If-Then) blocks
-              // without dumping the pipeline. Replaces complex bounds `if` ladders.
-              // =========================================================================
-              curNoteA = (dNoteA >= 0.0f) ? (curNoteA >= stopNoteA ? stopNoteA : curNoteA)
-                                          : (curNoteA <= stopNoteA ? stopNoteA : curNoteA);
-              curNoteB = (dNoteB >= 0.0f) ? (curNoteB >= stopNoteB ? stopNoteB : curNoteB)
-                                          : (curNoteB <= stopNoteB ? stopNoteB : curNoteB);
+            // =========================================================================
+            // OPTIMIZATION PILLAR I: Branchless Conditional Moves
+            // Nested ternary operators map directly to hardware IT (If-Then) blocks
+            // without dumping the pipeline. Replaces complex bounds `if` ladders.
+            // =========================================================================
+            curNoteA = (dNoteA >= 0.0f) ? (curNoteA >= stopNoteA ? stopNoteA : curNoteA)
+                                        : (curNoteA <= stopNoteA ? stopNoteA : curNoteA);
+            curNoteB = (dNoteB >= 0.0f) ? (curNoteB >= stopNoteB ? stopNoteB : curNoteB)
+                                        : (curNoteB <= stopNoteB ? stopNoteB : curNoteB);
 
-              porta_note_cur_f[DCO_A] = curNoteA;
-              porta_note_cur_f[DCO_B] = curNoteB;
+            porta_note_cur_f[DCO_A] = curNoteA;
+            porta_note_cur_f[DCO_B] = curNoteB;
 
-              curA = (curNoteA == stopNoteA) ? porta_freq_stop_f[DCO_A] : noteIndex_to_freqFloat(curNoteA);
-              curB = (curNoteB == stopNoteB) ? porta_freq_stop_f[DCO_B] : noteIndex_to_freqFloat(curNoteB);
+            curA = (curNoteA == stopNoteA) ? porta_freq_stop_f[DCO_A] : noteIndex_to_freqFloat(curNoteA);
+            curB = (curNoteB == stopNoteB) ? porta_freq_stop_f[DCO_B] : noteIndex_to_freqFloat(curNoteB);
 
-              porta_freq_cur_f[DCO_A] = curA;
-              porta_freq_cur_f[DCO_B] = curB;
-          }
+            porta_freq_cur_f[DCO_A] = curA;
+            porta_freq_cur_f[DCO_B] = curB;
+        }
 
-          freqA = curA;
-          freqB = curB;
+        freqA = curA;
+        freqB = curB;
 
-      } else {
-          freqA = noteFreq1;
-          freqB = noteFreq2;
+    } else {
+        freqA = noteFreq1;
+        freqB = noteFreq2;
 
-          porta_freq_cur_f[DCO_A] = freqA;
-          porta_freq_cur_f[DCO_B] = freqB;
-          porta_freq_stop_f[DCO_A] = freqA;
-          porta_freq_stop_f[DCO_B] = freqB;
-          porta_note_cur_f[DCO_A] = (float)note1;
-          porta_note_cur_f[DCO_B] = (float)note2;
-          porta_note_stop_f[DCO_A] = (float)note1;
-          porta_note_stop_f[DCO_B] = (float)note2;
-          porta_note_valid[DCO_A] = true;
-          porta_note_valid[DCO_B] = true;
-      }
+        porta_freq_cur_f[DCO_A] = freqA;
+        porta_freq_cur_f[DCO_B] = freqB;
+        porta_freq_stop_f[DCO_A] = freqA;
+        porta_freq_stop_f[DCO_B] = freqB;
+        porta_note_cur_f[DCO_A] = (float)note1;
+        porta_note_cur_f[DCO_B] = (float)note2;
+        porta_note_stop_f[DCO_A] = (float)note1;
+        porta_note_stop_f[DCO_B] = (float)note2;
+        porta_note_valid[DCO_A] = true;
+        porta_note_valid[DCO_B] = true;
+    }
 
-      #if defined(BENCH_PATH_STATS)
-      if (portaTime == 0) {
-          BENCH_PATH_INC(porta_off);
-      } else if (is_note_on) {
-          BENCH_PATH_INC(porta_note_on);
-      } else if (portaTimeChanged || portaModeChanged || pitchTargetChanged) {
-          BENCH_PATH_INC(porta_retime);
-      } else if (portaMode == PORTA_MODE_TIME) {
-          BENCH_PATH_INC(porta_steady_time);
-      } else {
-          BENCH_PATH_INC(porta_steady_slew);
-      }
-      #endif
+    #if defined(BENCH_PATH_STATS)
+    if (portaTime == 0) {
+        BENCH_PATH_INC(porta_off);
+    } else if (is_note_on) {
+        BENCH_PATH_INC(porta_note_on);
+    } else if (portaTimeChanged || portaModeChanged || pitchTargetChanged) {
+        BENCH_PATH_INC(porta_retime);
+    } else if (portaMode == PORTA_MODE_TIME) {
+        BENCH_PATH_INC(porta_steady_time);
+    } else {
+        BENCH_PATH_INC(porta_steady_slew);
+    }
+    #endif
 
-      #if DCO_DEBUG_REPORT
-      dbg_freq_base_Hz = freqA;
-      #endif
+    #if DCO_DEBUG_REPORT
+    dbg_freq_base_Hz = freqA;
+    #endif
 
-      BENCH_END(vt_portamento);
-
-
-      BENCH_BEGIN(vt_adsr_mod);
-      float ADSRModifier = (float)adsr3_lvl[i] * ADSR3toDETUNE1_scale_f;
-      float ADSRModifierOSC1 = adsr_osc1_en ? ADSRModifier : 0.0f;
-      float ADSRModifierOSC2 = adsr_osc2_en ? ADSRModifier : 0.0f;
-      BENCH_END(vt_adsr_mod);
-
-      BENCH_BEGIN(vt_drift_mod);
-      float DETUNE_DRIFT_OSC1 = (float)LFO_DRIFT_LEVEL[DCO_A] * drift_pitch_scale_f;
-      float DETUNE_DRIFT_OSC2 = (float)LFO_DRIFT_LEVEL[DCO_B] * drift_pitch_scale_f;
-      BENCH_END(vt_drift_mod);
-
-      BENCH_BEGIN(vt_unison_mod);
-      float voiceMag = (float)((i >> 1) + 1);
-      float voiceSign = ((i & 0x01) == 0) ? 1.0f : -1.0f;
-      float unisonMODIFIER = unisonBase * (voiceSign * voiceMag);
-      BENCH_END(vt_unison_mod);
+    BENCH_END(vt_portamento);
 
 
-      BENCH_BEGIN(vt_modifiers);
-      // Pure float mod matrix sums (1.0f = 1 Octave, 0 conversions)
-      const float matrix_osc1_f = matrix_pitch_mod_f[i] + matrix_osc1_pitch_mod_f[i];
-      const float matrix_osc2_f = matrix_pitch_mod_f[i] + matrix_osc2_pitch_mod_f[i];
+    BENCH_BEGIN(vt_adsr_mod);
+    float ADSRModifier = (float)adsr3_lvl[i] * ADSR3toDETUNE1_scale_f;
+    float ADSRModifierOSC1 = adsr_osc1_en ? ADSRModifier : 0.0f;
+    float ADSRModifierOSC2 = adsr_osc2_en ? ADSRModifier : 0.0f;
+    BENCH_END(vt_adsr_mod);
 
-      float modifiersBase = calcPitchbend + EPS_FLOAT + unisonMODIFIER + char_pitch_delta_f;
+    BENCH_BEGIN(vt_drift_mod);
+    float DETUNE_DRIFT_OSC1 = (float)LFO_DRIFT_LEVEL[DCO_A] * drift_pitch_scale_f;
+    float DETUNE_DRIFT_OSC2 = (float)LFO_DRIFT_LEVEL[DCO_B] * drift_pitch_scale_f;
+    BENCH_END(vt_drift_mod);
 
-      // lfo2 is hardwired to OSC2 (`freqModifiers2`),
-      // while matrix/lfo1 hit both or respective oscillators:
-      float freqModifiers1 = ADSRModifierOSC1 + DETUNE_DRIFT_OSC1 + modifiersBase + lfo1_osc1_f + matrix_osc1_f;
-      float freqModifiers2 = ADSRModifierOSC2 + DETUNE_DRIFT_OSC2 + modifiersBase + lfo1_osc2_f + lfo2_osc2_f + matrix_osc2_f;
-      BENCH_END(vt_modifiers);
-
-
-      BENCH_BEGIN(vt_freq_scale_x);
-      BENCH_END(vt_freq_scale_x);
-
-      BENCH_BEGIN(vt_ratio_interp);
-      // for testing and debug
-      // float bipolar_offset =  freqModifiers1 - 1.0f; // Range: [-1.0f .. +1.0f]
-       //float ratio1 = exp2f(freqModifiers1 - 1.0f);
-      float ratio1 = interpolate_live_ratio_f(freqModifiers1, DCO_A);
-      float ratio2 = interpolate_live_ratio_f(freqModifiers2, DCO_B);
-      BENCH_END(vt_ratio_interp);
-
-      BENCH_BEGIN(vt_freq_scale_post);
-      float freqA_Hz = noteFreq1 * ratio1;
-      float freqB_Hz = noteFreq2 * (ratio2 * osc2DetuneRatio);
-
-      #if DCO_DEBUG_REPORT
-      dbg_freq_after_mod_Hz = freqA_Hz;
-      #endif
-
-      BENCH_END(vt_freq_scale_post);
+    BENCH_BEGIN(vt_unison_mod);
+    // OPTIMIZATION: 1-cycle table lookup replaces bit-shifts, float conversions, and branches
+    float unisonMODIFIER = unisonBase * UNISON_VOICE_WEIGHTS[i & 0x0F];
+    BENCH_END(vt_unison_mod);
 
 
+    BENCH_BEGIN(vt_modifiers);
+    // Pure float mod matrix sums (1.0f = 1 Octave, 0 conversions)
+    // Uses hoisted restricted pointers and pre-adds common pitch term
+    const float p_mod = m_pitch_f[i];
+    const float matrix_osc1_f = p_mod + m_osc1_f[i];
+    const float matrix_osc2_f = p_mod + m_osc2_f[i];
 
-      // CROSS MODULATION
-      // =============================================================================
-      // LINEAR / EXPONENTIAL FM CROSSMOD VERSION
-      // =============================================================================
+    float modifiersBase = global_mods + unisonMODIFIER;
+
+    // lfo2 is hardwired to OSC2 (`freqModifiers2`),
+    // while matrix/lfo1 hit both or respective oscillators:
+    float freqModifiers1 = ADSRModifierOSC1 + DETUNE_DRIFT_OSC1 + modifiersBase + lfo1_osc1_f + matrix_osc1_f;
+    float freqModifiers2 = ADSRModifierOSC2 + DETUNE_DRIFT_OSC2 + modifiersBase + lfo1_osc2_f + lfo2_osc2_f + matrix_osc2_f;
+    BENCH_END(vt_modifiers);
+
+
+    BENCH_BEGIN(vt_freq_scale_x);
+    BENCH_END(vt_freq_scale_x);
+
+    BENCH_BEGIN(vt_ratio_interp);
+    // for testing and debug
+    // float bipolar_offset =  freqModifiers1 - 1.0f; // Range: [-1.0f .. +1.0f]
+    // float ratio1 = exp2f(freqModifiers1 - 1.0f);
+    float ratio1 = interpolate_live_ratio_f(freqModifiers1, DCO_A);
+    float ratio2 = interpolate_live_ratio_f(freqModifiers2, DCO_B);
+    BENCH_END(vt_ratio_interp);
+
+    BENCH_BEGIN(vt_freq_scale_post);
+    float freqA_Hz = freqA * (ratio1 * osc1DetuneRatio);
+    float freqB_Hz = freqB * (ratio2 * osc2DetuneRatio);
+
+    #if DCO_DEBUG_REPORT
+    dbg_freq_after_mod_Hz = freqA_Hz;
+    #endif
+
+    BENCH_END(vt_freq_scale_post);
+
+
+    // CROSS MODULATION
+    // =============================================================================
+    // LINEAR / EXPONENTIAL FM CROSSMOD VERSION
+    // =============================================================================
 //      BENCH_BEGIN(vt_cross_mod);
 // // --- USER TWEAK ZONE ---
 //       // Linear depth max 0.92f: swings between 8% and 192% of pitch symmetrically in Hz
@@ -952,234 +987,232 @@ void SRAM_HOT(voice_task_float)() {
 //      BENCH_END(vt_cross_mod);
 
 
-BENCH_BEGIN(vt_cross_mod);
+    BENCH_BEGIN(vt_cross_mod);
 
-float pio_freqA_Hz = freqA_Hz;
-float pio_freqB_Hz = freqB_Hz;
+    float pio_freqA_Hz = freqA_Hz;
+    float pio_freqB_Hz = freqB_Hz;
 
-if (sm == 2) {
-    // SYNC MODE 2: Osc A is Master, Osc B is Slave
-    // Master (A) modulates Slave (B) -> Target pio_freqB_Hz!
-    pio_freqB_Hz = apply_crossmod(i, freqB_Hz, freqA_Hz, hz_to_phase_inc, m_xmod[i]);
-} else {
-    // DEFAULT / SYNC MODE 1: Osc B is Master (or Sync Off)
-    // Osc B modulates Osc A -> Target pio_freqA_Hz!
-    pio_freqA_Hz = apply_crossmod(i, freqA_Hz, freqB_Hz, hz_to_phase_inc, m_xmod[i]);
-}
+    if (sm == 2) {
+        // SYNC MODE 2: Osc A is Master, Osc B is Slave
+        // Master (A) modulates Slave (B) -> Target pio_freqB_Hz!
+        pio_freqB_Hz = apply_crossmod(i, freqB_Hz, freqA_Hz, hz_to_phase_inc, m_xmod[i]);
+    } else {
+        // DEFAULT / SYNC MODE 1: Osc B is Master (or Sync Off)
+        // Osc B modulates Osc A -> Target pio_freqA_Hz!
+        pio_freqA_Hz = apply_crossmod(i, freqA_Hz, freqB_Hz, hz_to_phase_inc, m_xmod[i]);
+    }
 
-BENCH_END(vt_cross_mod);
+    BENCH_END(vt_cross_mod);
 
-     // =============================================================================
-     // EXPONENTIAL FM CROSSMOD VERSION with centered mode
-     // =============================================================================
-      // BENCH_BEGIN(vt_cross_mod);
-      
-      // // Initialize BOTH frequencies for clean state defaults
-      // float pio_freqA_Hz = freqA_Hz;
-      // float pio_freqB_Hz = freqB_Hz;
+    // =============================================================================
+    // EXPONENTIAL FM CROSSMOD VERSION with centered mode
+    // =============================================================================
+    // BENCH_BEGIN(vt_cross_mod);
+    // 
+    // // Initialize BOTH frequencies for clean state defaults
+    // float pio_freqA_Hz = freqA_Hz;
+    // float pio_freqB_Hz = freqB_Hz;
 
-      // int32_t total_mod_q15 = base_xmod + m_xmod[i];
+    // int32_t total_mod_q15 = base_xmod + m_xmod[i];
 
-      // if (total_mod_q15 > 0) {
-      //     // Clamp
-      //     if (total_mod_q15 > 32767) total_mod_q15 = 32767;
+    // if (total_mod_q15 > 0) {
+    //     // Clamp
+    //     if (total_mod_q15 > 32767) total_mod_q15 = 32767;
 
-      //     // Advance Osc B shadow phase (Q32 wrap via native overflow)
-      //     uint32_t phase = shadow_phase_osc2_q32[i];
-      //     phase += (uint32_t)(freqB_Hz * hz_to_phase_inc);
-      //     shadow_phase_osc2_q32[i] = phase;
+    //     // Advance Osc B shadow phase (Q32 wrap via native overflow)
+    //     uint32_t phase = shadow_phase_osc2_q32[i];
+    //     phase += (uint32_t)(freqB_Hz * hz_to_phase_inc);
+    //     shadow_phase_osc2_q32[i] = phase;
 
-      //     // Fast Branchless Triangle wave generation
-      //     uint32_t p2 = phase << 1;
-      //     uint32_t tri_u = (phase & 0x80000000) ? ~p2 : p2;
-      //     float shadow_tri = (float)tri_u * 4.65661287e-10f - 1.0f;
+    //     // Fast Branchless Triangle wave generation
+    //     uint32_t p2 = phase << 1;
+    //     uint32_t tri_u = (phase & 0x80000000) ? ~p2 : p2;
+    //     float shadow_tri = (float)tri_u * 4.65661287e-10f - 1.0f;
 
-      //     // Exponential FM with Optional Pitch Compensation
-      //     float mod_depth = (float)total_mod_q15 * depth_scaler;
-          
-      //     // If xmod_bias_coeff == 0.0f, the bias becomes 0.0f (vintage non-centered behavior)
-      //     float pitch_bias_octaves = xmod_bias_coeff * (mod_depth * mod_depth);
-      //     float octaves = (shadow_tri * mod_depth) - pitch_bias_octaves;
+    //     // Exponential FM with Optional Pitch Compensation
+    //     float mod_depth = (float)total_mod_q15 * depth_scaler;
+    //     
+    //     // If xmod_bias_coeff == 0.0f, the bias becomes 0.0f (vintage non-centered behavior)
+    //     float pitch_bias_octaves = xmod_bias_coeff * (mod_depth * mod_depth);
+    //     float octaves = (shadow_tri * mod_depth) - pitch_bias_octaves;
 
-      //     pio_freqA_Hz = freqA_Hz * fast_exp2f_audio(octaves);
-      // }
-      // BENCH_END(vt_cross_mod);
-
-
-      BENCH_BEGIN(vt_clk_div);
-   
-      uint32_t total_cycles1 = clkdiv_live_total_cycles(sysClock_Hz_cached_float, pio_freqA_Hz);
-      uint32_t total_cycles2 = clkdiv_live_total_cycles(sysClock_Hz_cached_float, pio_freqB_Hz);
-
-      uint32_t wA, kA, wB, kB;
-      get_osc_params(DCO_A, wA, kA);
-      get_osc_params(DCO_B, wB, kB);
-
-      uint32_t clk_div1 = pio_clk_div_for_y(total_cycles1, osc_last_y[DCO_A], wA, kA);
-      uint32_t clk_div2 = pio_clk_div_for_y(total_cycles2, osc_last_y[DCO_B], wB, kB);
-      BENCH_END(vt_clk_div);
+    //     pio_freqA_Hz = freqA_Hz * fast_exp2f_audio(octaves);
+    // }
+    // BENCH_END(vt_cross_mod);
 
 
-      // Prep variables for retrig 
-      BENCH_BEGIN(vt_note_retrig);
-      uint32_t phaseHoldX = 0;
-      PioPeriod retrig_p1{};
-      PioPeriod retrig_p2{};
-      if (is_note_on) {
-          if (oscPhaseSync > 1) {
-              BENCH_FBEGIN(vt_phase_align);
-              phaseHoldX = osc_phase_hold_x(total_cycles2, phaseAlignOSC2);
-              BENCH_FEND(vt_phase_align);
-          }
-          if (oscPhaseSync >= 1 && note_retrig_mode != NOTE_RETRIG_SYNC_JMP) {
-              BENCH_FBEGIN(vt_retrig_split);
-              retrig_p1 = pio_period_split(total_cycles1, wA, kA);
-              retrig_p2 = pio_period_split(total_cycles2, wB, kB);
-              BENCH_FEND(vt_retrig_split);
-          }
-      }
-      BENCH_END(vt_note_retrig);
+    BENCH_BEGIN(vt_clk_div);
 
-      BENCH_BEGIN(vt_chan_level);
-      uint16_t chanLevel, chanLevel2;
-      switch (sm) {
-          case 1: {
-              float maxFreq = (freqA_Hz > freqB_Hz) ? freqA_Hz : freqB_Hz;
-              chanLevel  = get_chan_level_for_engine(maxFreq, DCO_A);
-              chanLevel2 = get_chan_level_for_engine(freqB_Hz, DCO_B);
-              break;
-          }
-          case 2: {
-              float maxFreq = (freqA_Hz > freqB_Hz) ? freqA_Hz : freqB_Hz;
-              chanLevel  = get_chan_level_for_engine(freqA_Hz, DCO_A);
-              chanLevel2 = get_chan_level_for_engine(maxFreq, DCO_B);
-              break;
-          }
-          default:
-              chanLevel  = get_chan_level_for_engine(freqA_Hz, DCO_A);
-              chanLevel2 = get_chan_level_for_engine(freqB_Hz, DCO_B);
-              break;
-      }
-      BENCH_END(vt_chan_level);
+    uint32_t total_cycles1 = clkdiv_live_total_cycles(sysClock_Hz_cached_float, pio_freqA_Hz);
+    uint32_t total_cycles2 = clkdiv_live_total_cycles(sysClock_Hz_cached_float, pio_freqB_Hz);
 
-      BENCH_BEGIN(vt_range_pwm);
-      // Calculate Range levels
-      if (character) {
-        // Proportional jitter: ±5% of this specific note's level
-        const int32_t amp_j_A = ((int32_t)chanLevel  * char_amp_mod_factor) >> 15;
-        const int32_t amp_j_B = ((int32_t)chanLevel2 * char_amp_mod_factor) >> 15;
+    uint32_t wA, kA, wB, kB;
+    get_osc_params(DCO_A, wA, kA);
+    get_osc_params(DCO_B, wB, kB);
 
-        RANGE_PWM[DCO_A] = character_clamp_amp((int32_t)chanLevel  + amp_j_A);
-        RANGE_PWM[DCO_B] = character_clamp_amp((int32_t)chanLevel2 + amp_j_B);
-      } else {
-        RANGE_PWM[DCO_A] = chanLevel;
-        RANGE_PWM[DCO_B] = chanLevel2;
-      }
-      BENCH_END(vt_range_pwm);
-
-      PIO pioN_A = pio[VOICE_TO_PIO[DCO_A]];
-      PIO pioN_B = pio[VOICE_TO_PIO[DCO_B]];
-      uint8_t sm1N = VOICE_TO_SM[DCO_A];
-      uint8_t sm2N = VOICE_TO_SM[DCO_B];
-
-      if (is_note_on) {
-          BENCH_BEGIN(vt_retrig_sm_apply);
-          if (oscPhaseSync >= 1) {
-              // Phase sync mode: Hard phase reset
-              if (note_retrig_mode != NOTE_RETRIG_SYNC_JMP) {
-                  uint32_t maskAB = (1u << sm1N) | (1u << sm2N);
-                  pio_set_sm_mask_enabled(pioN_A, maskAB, false);
-
-                  osc_load_periods_stopped_noclear(DCO_A, retrig_p1.y, retrig_p1.clk_div,
-                                                   DCO_B, retrig_p2.y, retrig_p2.clk_div);
-
-                  pio_sm_exec(pioN_A, sm1N, pio_encode_jmp(osc_restart_target(DCO_A)));
-
-                  if (phaseHoldX != 0) {
-                      osc_phase_align_hold_stopped(DCO_B, phaseHoldX);
-                  } else {
-                      pio_sm_exec(pioN_B, sm2N, pio_encode_jmp(osc_restart_target(DCO_B)));
-                  }
-
-                  pio_enable_sm_mask_in_sync(pioN_A, maskAB);
-              } else {
-                  pio_sm_put(pioN_A, sm1N, clk_div1);
-                  pio_sm_put(pioN_B, sm2N, clk_div2);
-                  pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
-                  pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true));
-                  pio_sm_exec(pioN_A, sm1N, pio_encode_jmp(osc_restart_target(DCO_A)));
-                  pio_sm_exec(pioN_B, sm2N, pio_encode_jmp(osc_restart_target(DCO_B)));
-                  osc_last_clk_div[DCO_A] = clk_div1;
-                  osc_last_clk_div[DCO_B] = clk_div2;
-              }
-          } else {
-              // =================================================================
-              // FREE-RUNNING OSCILLATORS (oscPhaseSync == 0):
-              // Pull new divider AND force X to take it immediately!
-              // This shortens the current ramp to the new note instantly without
-              // forcing a hard phase restart.
-              // =================================================================
-            #if defined(UPDATE_CLK_DIV_INSTANTLY)
-              update_osc_clk_div_instantly(pioN_A, sm1N, DCO_A, clk_div1, true);
-              update_osc_clk_div_instantly(pioN_B, sm2N, DCO_B, clk_div2, true);
-            #else
-              pio_sm_put(pioN_A, sm1N, clk_div1);
-              pio_sm_put(pioN_B, sm2N, clk_div2);
-              pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
-              pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true));
-            #endif
-
-              // // Fallback for when the above doesn't work:
-              // pio_sm_put(pioN_A, sm1N, clk_div1);
-              // pio_sm_put(pioN_B, sm2N, clk_div2);
-              // pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
-              // pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true)); 
-              // // instant note change:
-              // pio_sm_exec(pioN_A, sm1N, pio_encode_mov(pio_x, pio_osr));
-              // pio_sm_exec(pioN_B, sm1N, pio_encode_mov(pio_x, pio_osr));
-
-              osc_last_clk_div[DCO_A] = clk_div1;
-              osc_last_clk_div[DCO_B] = clk_div2;
-          }
-          BENCH_END(vt_retrig_sm_apply);
-
-      } else {
-          // Normal running frame: update clk_div continuously for vibrato/LFOs
-          BENCH_BEGIN(vt_pio_write);
-          #if defined(UPDATE_CLK_DIV_INSTANTLY)
-          update_osc_clk_div_instantly(pioN_A, sm1N, DCO_A, clk_div1);
-          update_osc_clk_div_instantly(pioN_B, sm2N, DCO_B, clk_div2);
-          #else
-          pio_sm_put(pioN_A, sm1N, clk_div1);
-          pio_sm_put(pioN_B, sm2N, clk_div2);
-          pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
-          pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true));
-          #endif
-          osc_last_clk_div[DCO_A] = clk_div1;
-          osc_last_clk_div[DCO_B] = clk_div2;
-          BENCH_END(vt_pio_write);
-      }
+    uint32_t clk_div1 = pio_clk_div_for_y(total_cycles1, osc_last_y[DCO_A], wA, kA);
+    uint32_t clk_div2 = pio_clk_div_for_y(total_cycles2, osc_last_y[DCO_B], wB, kB);
+    BENCH_END(vt_clk_div);
 
 
-
-
-      if (timer99microsFlag2) {
-        if (pulseWaveOn) {
-          BENCH_BEGIN(vt_pwm_calc);
-          const int32_t adsr3_delta = ((int32_t)adsr3_lvl[i] * (int32_t)ADSR3toPWM) >> 15;
-          int32_t pw_calc = (int32_t)PW[0] + lfo2_pw_delta + adsr3_delta + (int32_t)m_pw[i] + char_pw_delta_i;
-      
-          // RP2350 OPTIMIZED: Truly Branchless Nested Clamp
-          // Forces GCC to evaluate bounds completely in registers (IT Blocks)
-          const int32_t max_pw = (int32_t)(DIV_COUNTER_PW - 1);
-          pw_calc = (pw_calc < 0) ? 0 : ((pw_calc > max_pw) ? max_pw : pw_calc);
-      
-          PW_PWM[i] = get_PW_level_interpolated<PW_SWEEP_FULL>((uint16_t)pw_calc, DCO_A, freqA_Hz);
-          BENCH_END(vt_pwm_calc);
-        } else {
-          PW_PWM[i] = 0;
+    // Prep variables for retrig 
+    BENCH_BEGIN(vt_note_retrig);
+    uint32_t phaseHoldX = 0;
+    PioPeriod retrig_p1{};
+    PioPeriod retrig_p2{};
+    if (is_note_on) {
+        if (oscPhaseSync > 1) {
+            BENCH_FBEGIN(vt_phase_align);
+            phaseHoldX = osc_phase_hold_x(total_cycles2, phaseAlignOSC2);
+            BENCH_FEND(vt_phase_align);
         }
+        if (oscPhaseSync >= 1 && note_retrig_mode != NOTE_RETRIG_SYNC_JMP) {
+            BENCH_FBEGIN(vt_retrig_split);
+            retrig_p1 = pio_period_split(total_cycles1, wA, kA);
+            retrig_p2 = pio_period_split(total_cycles2, wB, kB);
+            BENCH_FEND(vt_retrig_split);
+        }
+    }
+    BENCH_END(vt_note_retrig);
+
+    BENCH_BEGIN(vt_chan_level);
+    uint16_t chanLevel, chanLevel2;
+    switch (sm) {
+        case 1: {
+            float maxFreq = (freqA_Hz > freqB_Hz) ? freqA_Hz : freqB_Hz;
+            chanLevel  = get_chan_level_for_engine(maxFreq, DCO_A);
+            chanLevel2 = get_chan_level_for_engine(freqB_Hz, DCO_B);
+            break;
+        }
+        case 2: {
+            float maxFreq = (freqA_Hz > freqB_Hz) ? freqA_Hz : freqB_Hz;
+            chanLevel  = get_chan_level_for_engine(freqA_Hz, DCO_A);
+            chanLevel2 = get_chan_level_for_engine(maxFreq, DCO_B);
+            break;
+        }
+        default:
+            chanLevel  = get_chan_level_for_engine(freqA_Hz, DCO_A);
+            chanLevel2 = get_chan_level_for_engine(freqB_Hz, DCO_B);
+            break;
+    }
+    BENCH_END(vt_chan_level);
+
+    BENCH_BEGIN(vt_range_pwm);
+    // Calculate Range levels
+    if (character) {
+      // Proportional jitter: ±5% of this specific note's level
+      const int32_t amp_j_A = ((int32_t)chanLevel  * char_amp_mod_factor) >> 15;
+      const int32_t amp_j_B = ((int32_t)chanLevel2 * char_amp_mod_factor) >> 15;
+
+      RANGE_PWM[DCO_A] = character_clamp_amp((int32_t)chanLevel  + amp_j_A);
+      RANGE_PWM[DCO_B] = character_clamp_amp((int32_t)chanLevel2 + amp_j_B);
+    } else {
+      RANGE_PWM[DCO_A] = chanLevel;
+      RANGE_PWM[DCO_B] = chanLevel2;
+    }
+    BENCH_END(vt_range_pwm);
+
+    PIO pioN_A = pio[VOICE_TO_PIO[DCO_A]];
+    PIO pioN_B = pio[VOICE_TO_PIO[DCO_B]];
+    uint8_t sm1N = VOICE_TO_SM[DCO_A];
+    uint8_t sm2N = VOICE_TO_SM[DCO_B];
+
+    if (is_note_on) {
+        BENCH_BEGIN(vt_retrig_sm_apply);
+        if (oscPhaseSync >= 1) {
+            // Phase sync mode: Hard phase reset
+            if (note_retrig_mode != NOTE_RETRIG_SYNC_JMP) {
+                uint32_t maskAB = (1u << sm1N) | (1u << sm2N);
+                pio_set_sm_mask_enabled(pioN_A, maskAB, false);
+
+                osc_load_periods_stopped_noclear(DCO_A, retrig_p1.y, retrig_p1.clk_div,
+                                                 DCO_B, retrig_p2.y, retrig_p2.clk_div);
+
+                pio_sm_exec(pioN_A, sm1N, pio_encode_jmp(osc_restart_target(DCO_A)));
+
+                if (phaseHoldX != 0) {
+                    osc_phase_align_hold_stopped(DCO_B, phaseHoldX);
+                } else {
+                    pio_sm_exec(pioN_B, sm2N, pio_encode_jmp(osc_restart_target(DCO_B)));
+                }
+
+                pio_enable_sm_mask_in_sync(pioN_A, maskAB);
+            } else {
+                pio_sm_put(pioN_A, sm1N, clk_div1);
+                pio_sm_put(pioN_B, sm2N, clk_div2);
+                pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
+                pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true));
+                pio_sm_exec(pioN_A, sm1N, pio_encode_jmp(osc_restart_target(DCO_A)));
+                pio_sm_exec(pioN_B, sm2N, pio_encode_jmp(osc_restart_target(DCO_B)));
+                osc_last_clk_div[DCO_A] = clk_div1;
+                osc_last_clk_div[DCO_B] = clk_div2;
+            }
+        } else {
+            // =================================================================
+            // FREE-RUNNING OSCILLATORS (oscPhaseSync == 0):
+            // Pull new divider AND force X to take it immediately!
+            // This shortens the current ramp to the new note instantly without
+            // forcing a hard phase restart.
+            // =================================================================
+          #if defined(UPDATE_CLK_DIV_INSTANTLY)
+            update_osc_clk_div_instantly(pioN_A, sm1N, DCO_A, clk_div1);
+            update_osc_clk_div_instantly(pioN_B, sm2N, DCO_B, clk_div2);
+          #else
+            pio_sm_put(pioN_A, sm1N, clk_div1);
+            pio_sm_put(pioN_B, sm2N, clk_div2);
+            pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
+            pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true));
+          #endif
+
+            // // Fallback for when the above doesn't work:
+            // pio_sm_put(pioN_A, sm1N, clk_div1);
+            // pio_sm_put(pioN_B, sm2N, clk_div2);
+            // pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
+            // pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true)); 
+            // // instant note change:
+            // pio_sm_exec(pioN_A, sm1N, pio_encode_mov(pio_x, pio_osr));
+            // pio_sm_exec(pioN_B, sm1N, pio_encode_mov(pio_x, pio_osr));
+
+            osc_last_clk_div[DCO_A] = clk_div1;
+            osc_last_clk_div[DCO_B] = clk_div2;
+        }
+        BENCH_END(vt_retrig_sm_apply);
+
+    } else {
+        // Normal running frame: update clk_div continuously for vibrato/LFOs
+        BENCH_BEGIN(vt_pio_write);
+        #if defined(UPDATE_CLK_DIV_INSTANTLY)
+        update_osc_clk_div_instantly(pioN_A, sm1N, DCO_A, clk_div1);
+        update_osc_clk_div_instantly(pioN_B, sm2N, DCO_B, clk_div2);
+        #else
+        pio_sm_put(pioN_A, sm1N, clk_div1);
+        pio_sm_put(pioN_B, sm2N, clk_div2);
+        pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
+        pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true));
+        #endif
+        osc_last_clk_div[DCO_A] = clk_div1;
+        osc_last_clk_div[DCO_B] = clk_div2;
+        BENCH_END(vt_pio_write);
+    }
+
+    if (timer99microsFlag2) {
+      if (pulseWaveOn) {
+        BENCH_BEGIN(vt_pwm_calc);
+        const int32_t adsr3_delta = ((int32_t)adsr3_lvl[i] * (int32_t)ADSR3toPWM) >> 15;
+        // Hoisted base_pw_val eliminates 2 redundant additions per voice
+        int32_t pw_calc = base_pw_val + adsr3_delta + (int32_t)m_pw[i];
+
+        // RP2350 OPTIMIZED: Truly Branchless Nested Clamp
+        // Forces GCC to evaluate bounds completely in registers (IT Blocks)
+        const int32_t max_pw = (int32_t)(DIV_COUNTER_PW - 1);
+        pw_calc = (pw_calc < 0) ? 0 : ((pw_calc > max_pw) ? max_pw : pw_calc);
+
+        PW_PWM[i] = get_PW_level_interpolated<PW_SWEEP_FULL>((uint16_t)pw_calc, DCO_A, freqA_Hz);
+        BENCH_END(vt_pwm_calc);
+      } else {
+        PW_PWM[i] = 0;
       }
+    }
   } // end loop
 
   BENCH_BEGIN(vt_teardown);

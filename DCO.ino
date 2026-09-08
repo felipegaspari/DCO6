@@ -23,6 +23,7 @@
 #include "hardware/irq.h"
 #include "LittleFS.h"
 #include "pico-dco.pio.h"
+#include "hardware/structs/bus_ctrl.h"
 
 
 // 1. Protocol & Framework Libraries
@@ -114,12 +115,17 @@ void setup() {
   preset_store_boot_task();
   // One chunk of a pending 'N' directory push, paced for the Mainboard relay.
   preset_store_dir_push_task();
-#endif
+  #else
+  preset_store_load(4);
+  #endif
 
 
   pinMode(DCO_calibration_pin, INPUT);
+
+  #if (DCO_MCU_BOARD != DCO_MCU_WEACT_RP2350)
   pinMode(24, OUTPUT);
   digitalWrite(24, HIGH);
+  #endif
 }
 
 // Core 1 boot: LittleFS cal load, ADSR, amp-comp precompute, PWM/PIO, voices.
@@ -161,6 +167,9 @@ void setup1() {
   dcoNoisePioBegin(pio[NOISE_PIO], NOISE_SM);
 #endif
   init_voices();
+  
+  // Set the priority of the bus to CORE 1
+  bus_ctrl_hw->priority = BUSCTRL_BUS_PRIORITY_PROC1_BITS;
 }
 
 // Core 0 forever loop: MIDI every iter; Serial2 + USB CDC on 1 ms; ~50 µs LFO1 + LFO2 + drift.
