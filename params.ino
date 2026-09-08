@@ -147,7 +147,6 @@ static void SRAM_HOT(apply_param_crossmod_depth)(int16_t v) {
 
 static void SRAM_HOT(apply_param_crossmod_mode)(int16_t v)   { 
   crossmod_mode = (uint8_t)v; 
-  update_crossmod_prebake(crossmod_depth);
 }
 
  static void SRAM_HOT(apply_param_subosc_divide)(int16_t v) { subOscDivide = (uint8_t)v; }
@@ -182,148 +181,84 @@ static void SRAM_HOT(apply_param_crossmod_mode)(int16_t v)   {
 // 2. LFO SPEEDS, WAVEFORMS & PITCH DEPTHS
 // =============================================================================
 
-// =============================================================================
-// LFO1 PITCH APPLIERS
-// =============================================================================
+// --- LFO1 Pitch Appliers (4 Octaves Max) ---
+
+// --- LFO1 Pitch Appliers ---
 
 static void SRAM_HOT(apply_param_lfo1_to_dco)(int16_t v) {
   LFO1toDCOVal = (uint16_t)constrain(v, 0, 511);
-  const float norm = fast_lfo_depth_norm<511>(LFO1toDCOVal);
-
-  // Peak modulation depth in octaves (0.0 to 4.0)
-  const float depth_octaves = norm * LFO_4_OCTAVES;
-  
-  // NEGATIVE sign: Subtract pitch to cancel the natural exponential sharpness
-  const float comp_octaves = -0.1733f * (depth_octaves * depth_octaves);
-
 #if defined(USE_FLOAT_VOICE_TASK)
-  LFO1toDCO_f = lfo_pitch_depth_f(norm, LFO_4_OCTAVES);
-  LFO1toDCO_comp_f = comp_octaves;
+  LFO1toDCO_f = lfo_pitch_depth_f(fast_lfo_depth_norm<511>(LFO1toDCOVal), LFO_4_OCTAVES);
 #else
-  LFO1toDCO_q24 = lfo_pitch_depth_q24(norm, LFO_4_OCTAVES_Q24);
-
-  // Convert negative octaves to Q24
-  LFO1toDCO_comp_q24 = (int32_t)(comp_octaves * 16777216.0f);
+  LFO1toDCO_q24 = lfo_pitch_depth_q24(fast_lfo_depth_norm<511>(LFO1toDCOVal), LFO_4_OCTAVES_Q24);
 #endif
 }
 
-
 static void SRAM_HOT(apply_param_lfo1_to_osc1)(int16_t v) {
   uint16_t val = (uint16_t)constrain(v, 0, 255);
-  const float norm = fast_lfo_depth_norm<255>(val);
-
 #if defined(USE_FLOAT_VOICE_TASK)
-  LFO1toOSC1_f = lfo_pitch_depth_f(norm, LFO_4_OCTAVES);
-  const float depth_octaves = norm * LFO_4_OCTAVES;
-  LFO1toOSC1_comp_f = -0.1733f * (depth_octaves * depth_octaves);
+  LFO1toOSC1_f = lfo_pitch_depth_f(fast_lfo_depth_norm<255>(val), LFO_4_OCTAVES);
 #else
-  LFO1toOSC1_q24 = lfo_pitch_depth_q24(norm, LFO_COARSE_2_OCTAVES_Q24);
-  const float depth_octaves = norm * ((float)LFO_COARSE_2_OCTAVES_Q24 * (1.0f / 16777216.0f));
-  const float comp_octaves = -0.1733f * (depth_octaves * depth_octaves);
-  LFO1toOSC1_comp_q24 = (int32_t)(comp_octaves * 16777216.0f);
+  LFO1toOSC1_q24 = lfo_pitch_depth_q24(fast_lfo_depth_norm<255>(val), LFO_COARSE_2_OCTAVES_Q24);
 #endif
 }
 
 static void SRAM_HOT(apply_param_lfo1_to_osc2)(int16_t v) {
   uint16_t val = (uint16_t)constrain(v, 0, 255);
-  const float norm = fast_lfo_depth_norm<255>(val);
-
 #if defined(USE_FLOAT_VOICE_TASK)
-  LFO1toOSC2_f = lfo_pitch_depth_f(norm, LFO_4_OCTAVES);
-  const float depth_octaves = norm * LFO_4_OCTAVES;
-  LFO1toOSC2_comp_f = -0.1733f * (depth_octaves * depth_octaves);
+  LFO1toOSC2_f = lfo_pitch_depth_f(fast_lfo_depth_norm<255>(val), LFO_4_OCTAVES);
 #else
-  LFO1toOSC2_q24 = lfo_pitch_depth_q24(norm, LFO_COARSE_2_OCTAVES_Q24);
-  const float depth_octaves = norm * ((float)LFO_COARSE_2_OCTAVES_Q24 * (1.0f / 16777216.0f));
-  const float comp_octaves = -0.1733f * (depth_octaves * depth_octaves);
-  LFO1toOSC2_comp_q24 = (int32_t)(comp_octaves * 16777216.0f);
+  LFO1toOSC2_q24 = lfo_pitch_depth_q24(fast_lfo_depth_norm<255>(val), LFO_COARSE_2_OCTAVES_Q24);
 #endif
 }
 
 static void SRAM_HOT(apply_param_lfo1_to_osc3)(int16_t v) {
   uint16_t val = (uint16_t)constrain(v, 0, 255);
-  const float norm = fast_lfo_depth_norm<255>(val);
-
 #if defined(USE_FLOAT_VOICE_TASK)
-  LFO1toOSC3_f = lfo_pitch_depth_f(norm, LFO_4_OCTAVES);
-  const float depth_octaves = norm * LFO_4_OCTAVES;
-  LFO1toOSC3_comp_f = -0.1733f * (depth_octaves * depth_octaves);
+  LFO1toOSC3_f = lfo_pitch_depth_f(fast_lfo_depth_norm<255>(val), LFO_4_OCTAVES);
 #else
-  LFO1toOSC3_q24 = lfo_pitch_depth_q24(norm, LFO_COARSE_2_OCTAVES_Q24);
-  const float depth_octaves = norm * ((float)LFO_COARSE_2_OCTAVES_Q24 * (1.0f / 16777216.0f));
-  const float comp_octaves = -0.1733f * (depth_octaves * depth_octaves);
-  LFO1toOSC3_comp_q24 = (int32_t)(comp_octaves * 16777216.0f);
+  LFO1toOSC3_q24 = lfo_pitch_depth_q24(fast_lfo_depth_norm<255>(val), LFO_COARSE_2_OCTAVES_Q24);
 #endif
 }
 
-// =============================================================================
-// LFO2 PITCH APPLIERS (Fine Vibrato & Coarse)
-// =============================================================================
+// --- LFO2 Pitch Appliers ---
 
 static void SRAM_HOT(apply_param_lfo2_to_osc2)(int16_t v) {
   uint16_t val = (uint16_t)constrain(v, 0, 255);
-  const float norm = fast_lfo_depth_norm<255>(val);
-
 #if defined(USE_FLOAT_VOICE_TASK)
-  LFO2toOSC2_f = lfo_pitch_depth_f(norm, LFO_VIBRATO_2_SEMITONES);
-  const float depth_octaves = norm * LFO_VIBRATO_2_SEMITONES;
-  LFO2toOSC2_comp_f = -0.1733f * (depth_octaves * depth_octaves);
+  LFO2toOSC2_f = lfo_pitch_depth_f(fast_lfo_depth_norm<255>(val), LFO_VIBRATO_2_SEMITONES);
 #else
-  LFO2toOSC2_q24 = lfo_pitch_depth_q24(norm, LFO_VIBRATO_2_SEMITONES_Q24);
-  const float depth_octaves = norm * ((float)LFO_VIBRATO_2_SEMITONES_Q24 * (1.0f / 16777216.0f));
-  const float comp_octaves = -0.1733f * (depth_octaves * depth_octaves);
-  LFO2toOSC2_comp_q24 = (int32_t)(comp_octaves * 16777216.0f);
+  LFO2toOSC2_q24 = lfo_pitch_depth_q24(fast_lfo_depth_norm<255>(val), LFO_VIBRATO_2_SEMITONES_Q24);
 #endif
 }
 
 static void SRAM_HOT(apply_param_lfo2_to_osc3)(int16_t v) {
   uint16_t val = (uint16_t)constrain(v, 0, 255);
-  const float norm = fast_lfo_depth_norm<255>(val);
-
 #if defined(USE_FLOAT_VOICE_TASK)
-  LFO2toOSC3_f = lfo_pitch_depth_f(norm, LFO_VIBRATO_2_SEMITONES);
-  const float depth_octaves = norm * LFO_VIBRATO_2_SEMITONES;
-  LFO2toOSC3_comp_f = -0.1733f * (depth_octaves * depth_octaves);
+  LFO2toOSC3_f = lfo_pitch_depth_f(fast_lfo_depth_norm<255>(val), LFO_VIBRATO_2_SEMITONES);
 #else
-  LFO2toOSC3_q24 = lfo_pitch_depth_q24(norm, LFO_VIBRATO_2_SEMITONES_Q24);
-  const float depth_octaves = norm * ((float)LFO_VIBRATO_2_SEMITONES_Q24 * (1.0f / 16777216.0f));
-  const float comp_octaves = -0.1733f * (depth_octaves * depth_octaves);
-  LFO2toOSC3_comp_q24 = (int32_t)(comp_octaves * 16777216.0f);
+  LFO2toOSC3_q24 = lfo_pitch_depth_q24(fast_lfo_depth_norm<255>(val), LFO_VIBRATO_2_SEMITONES_Q24);
 #endif
 }
 
 static void SRAM_HOT(apply_param_lfo2_to_osc2_coarse)(int16_t v) {
   uint16_t val = (uint16_t)constrain(v, 0, 511); 
-  const float norm = fast_lfo_depth_norm<511>(val);
-
 #if defined(USE_FLOAT_VOICE_TASK)
-  LFO2toOSC2_coarse_f = lfo_pitch_depth_f(norm, LFO_4_OCTAVES);
-  const float depth_octaves = norm * LFO_4_OCTAVES;
-  LFO2toOSC2_coarse_comp_f = -0.1733f * (depth_octaves * depth_octaves);
+  LFO2toOSC2_coarse_f = lfo_pitch_depth_f(fast_lfo_depth_norm<511>(val), LFO_4_OCTAVES);
 #else
-  LFO2toOSC2_coarse_q24 = lfo_pitch_depth_q24(norm, LFO_4_OCTAVES_Q24);
-  const float depth_octaves = norm * ((float)LFO_4_OCTAVES_Q24 * (1.0f / 16777216.0f));
-  const float comp_octaves = -0.1733f * (depth_octaves * depth_octaves);
-  LFO2toOSC2_coarse_comp_q24 = (int32_t)(comp_octaves * 16777216.0f);
+  LFO2toOSC2_coarse_q24 = lfo_pitch_depth_q24(fast_lfo_depth_norm<511>(val), LFO_4_OCTAVES_Q24);
 #endif
 }
 
 static void SRAM_HOT(apply_param_lfo2_to_osc3_coarse)(int16_t v) {
   uint16_t val = (uint16_t)constrain(v, 0, 511);
-  const float norm = fast_lfo_depth_norm<511>(val);
-
 #if defined(USE_FLOAT_VOICE_TASK)
-  LFO2toOSC3_coarse_f = lfo_pitch_depth_f(norm, LFO_4_OCTAVES);
-  const float depth_octaves = norm * LFO_4_OCTAVES;
-  LFO2toOSC3_coarse_comp_f = -0.1733f * (depth_octaves * depth_octaves);
+  LFO2toOSC3_coarse_f = lfo_pitch_depth_f(fast_lfo_depth_norm<511>(val), LFO_4_OCTAVES);
 #else
-  LFO2toOSC3_coarse_q24 = lfo_pitch_depth_q24(norm, LFO_4_OCTAVES_Q24);
-  const float depth_octaves = norm * ((float)LFO_4_OCTAVES_Q24 * (1.0f / 16777216.0f));
-  const float comp_octaves = -0.1733f * (depth_octaves * depth_octaves);
-  LFO2toOSC3_coarse_comp_q24 = (int32_t)(comp_octaves * 16777216.0f);
+  LFO2toOSC3_coarse_q24 = lfo_pitch_depth_q24(fast_lfo_depth_norm<511>(val), LFO_4_OCTAVES_Q24);
 #endif
 }
-
+ 
 static void SRAM_HOT(apply_param_lfo2_to_pw)(int16_t v) { 
   // Dynamically scales the input depth to match DIV_COUNTER_PW (normalized against 1024 base)
   LFO2toPW = (uint16_t)(((uint32_t)v * DIV_COUNTER_PW) / 1024); 

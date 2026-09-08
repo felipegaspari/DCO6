@@ -39,33 +39,36 @@ void init_LFO2() {
 static constexpr float LFO_RAW_TO_OCTAVES_F = 1.0f / 549755813888.0f;
 
 void SRAM_HOT(LFO1)() {
-  LFO1Level = LFO1_class.getWaveQ15(micros());
+  LFO1Level = LFO1_class.getWaveQ15(micros()); // Retain Q15 wave
 
 #if defined(USE_VOICE_ENGINE_FLOAT) || defined(USE_FLOAT_VOICE_TASK)
   const float wave = (float)LFO1Level;
 
-  lfo1_pitch_mod_f[LFO1_PITCH_OSC1] = (wave * (LFO1toDCO_f + LFO1toOSC1_f)) + (LFO1toDCO_comp_f + LFO1toOSC1_comp_f);
-  lfo1_pitch_mod_f[LFO1_PITCH_OSC2] = (wave * (LFO1toDCO_f + LFO1toOSC2_f)) + (LFO1toDCO_comp_f + LFO1toOSC2_comp_f);
-  lfo1_pitch_mod_f[LFO1_PITCH_OSC3] = (wave * (LFO1toDCO_f + LFO1toOSC3_f)) + (LFO1toDCO_comp_f + LFO1toOSC3_comp_f);
+  // Single-cycle VFMA: (wave * depth) + comp
+  lfo1_pitch_mod_f[LFO1_PITCH_OSC1] = (wave * (LFO1toDCO_f + LFO1toOSC1_f));
+  lfo1_pitch_mod_f[LFO1_PITCH_OSC2] = (wave * (LFO1toDCO_f + LFO1toOSC2_f));
+  lfo1_pitch_mod_f[LFO1_PITCH_OSC3] = (wave * (LFO1toDCO_f + LFO1toOSC3_f));
 #else
-  lfo1_pitch_mod_q24[LFO1_PITCH_OSC1] = applyDepthQ24(LFO1Level, LFO1toDCO_q24 + LFO1toOSC1_q24) + (LFO1toDCO_comp_q24 + LFO1toOSC1_comp_q24);
-  lfo1_pitch_mod_q24[LFO1_PITCH_OSC2] = applyDepthQ24(LFO1Level, LFO1toDCO_q24 + LFO1toOSC2_q24) + (LFO1toDCO_comp_q24 + LFO1toOSC2_comp_q24);
-  lfo1_pitch_mod_q24[LFO1_PITCH_OSC3] = applyDepthQ24(LFO1Level, LFO1toDCO_q24 + LFO1toOSC3_q24) + (LFO1toDCO_comp_q24 + LFO1toOSC3_comp_q24);
+  // RP2040 fixed-point fallback
+  lfo1_pitch_mod_q24[LFO1_PITCH_OSC1] = applyDepthQ24(LFO1Level, LFO1toDCO_q24 + LFO1toOSC1_q24);
+  lfo1_pitch_mod_q24[LFO1_PITCH_OSC2] = applyDepthQ24(LFO1Level, LFO1toDCO_q24 + LFO1toOSC2_q24);
+  lfo1_pitch_mod_q24[LFO1_PITCH_OSC3] = applyDepthQ24(LFO1Level, LFO1toDCO_q24 + LFO1toOSC3_q24);
 #endif
   __dmb();
 }
 
 void SRAM_HOT(LFO2)() {
-  LFO2Level = LFO2_class.getWaveQ15(micros());
+  LFO2Level = LFO2_class.getWaveQ15(micros()); // Retain Q15 wave
 
 #if defined(USE_VOICE_ENGINE_FLOAT) || defined(USE_FLOAT_VOICE_TASK)
   const float wave = (float)LFO2Level;
-
-  lfo2_pitch_mod_f[LFO2_PITCH_OSC2] = (wave * (LFO2toOSC2_f + LFO2toOSC2_coarse_f)) + (LFO2toOSC2_comp_f + LFO2toOSC2_coarse_comp_f);
-  lfo2_pitch_mod_f[LFO2_PITCH_OSC3] = (wave * (LFO2toOSC3_f + LFO2toOSC3_coarse_f)) + (LFO2toOSC3_comp_f + LFO2toOSC3_coarse_comp_f);
+  // 1 VADD.F32 + 1 VMUL.F32 per slot (Result in Float Octaves)
+  lfo2_pitch_mod_f[LFO2_PITCH_OSC2] = wave * (LFO2toOSC2_f + LFO2toOSC2_coarse_f);
+  lfo2_pitch_mod_f[LFO2_PITCH_OSC3] = wave * (LFO2toOSC3_f + LFO2toOSC3_coarse_f);
 #else
-  lfo2_pitch_mod_q24[LFO2_PITCH_OSC2] = applyDepthQ24(LFO2Level, LFO2toOSC2_q24 + LFO2toOSC2_coarse_q24) + (LFO2toOSC2_comp_q24 + LFO2toOSC2_coarse_comp_q24);
-  lfo2_pitch_mod_q24[LFO2_PITCH_OSC3] = applyDepthQ24(LFO2Level, LFO2toOSC3_q24 + LFO2toOSC3_coarse_q24) + (LFO2toOSC3_comp_q24 + LFO2toOSC3_coarse_comp_q24);
+  // RP2040 fixed-point fallback
+  lfo2_pitch_mod_q24[LFO2_PITCH_OSC2] = applyDepthQ24(LFO2Level, LFO2toOSC2_q24 + LFO2toOSC2_coarse_q24);
+  lfo2_pitch_mod_q24[LFO2_PITCH_OSC3] = applyDepthQ24(LFO2Level, LFO2toOSC3_q24 + LFO2toOSC3_coarse_q24);
 #endif
   __dmb();
 }

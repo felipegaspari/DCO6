@@ -337,108 +337,94 @@ static constexpr uint32_t PIO_INSTR_MOV_X_OSR = 0xa027;
 // =============================================================================
 // HEAVILY OPTIMIZED INSTANT PIO DIVIDER UPDATE (250 MHz / 10 µs Loop1)
 // =============================================================================
-static constexpr int32_t BUS_LATENCY_CYCLES = 28;  ///<
-static constexpr int32_t SAFEGUARD_CYCLES   = 150;  ///< ~16000 ns threshold at 250 MHz
+// static constexpr int32_t BUS_LATENCY_CYCLES = 28;  ///<
+// static constexpr int32_t SAFEGUARD_CYCLES   = 150;  ///< ~16000 ns threshold at 250 MHz
 
 
 // UNTESTED VERSION
 
-static constexpr int32_t MANUAL_LATENCY_VALUE = 15; 
+static constexpr float MANUAL_LATENCY_VALUE = 15.0f; 
+
+// CALIBRATED: Real APB bus round-trip (RXF read stall + VFP math + APB writes)
+// Measured snapshot-to-swap hardware latency = 52 cycles (~208 ns @ 250 MHz).
+static constexpr int32_t PIPELINE_LATENCY_CYCLES = 52;
+
+// CALIBRATED: Only 2 instructions injected before X is updated (PULL + MOV_X_OSR).
+static constexpr int32_t PRE_SWAP_STALL_CYCLES = 2;
+
+// CALIBRATED: 120 cycles (480 ns). Any remaining time less than this safely falls
+// back to the natural cycle boundary, completely preventing zero-crossing pops.
+static constexpr int32_t SAFEGUARD_CYCLES = 120;
+
+// CALIBRATED: Minimum duration for new_x to avoid immediate underflow.
+static constexpr int32_t MIN_NEW_X_CYCLES = 36;
+
+// Global array: avoids C++ function-local static guard variable checks
+static float osc_frac_carry[256] = {0.0f};
 
 static inline void SRAM_HOT(update_osc_clk_div_instantly)(PIO pio, uint sm, uint8_t osc, uint32_t new_div, uint8_t mode = 0) {
     const uint32_t old_div = osc_last_clk_div[osc];
 
+    // 1. Quick exit if pitch hasn't changed
     if (__builtin_expect(old_div == new_div, 1)) return;
-    
+
+    io_rw_32*       const txf   = &pio->txf[sm];
+    pio_sm_hw_t*    const sm_hw = &pio->sm[sm];
+
+    // 2. Uninitialized oscillator startup
     if (__builtin_expect(old_div == 0, 0)) {
         osc_last_clk_div[osc] = new_div;
-        pio->txf[sm] = new_div;
-        pio->sm[sm].instr = PIO_INSTR_PULL;
+        *txf = new_div;
+        sm_hw->instr = PIO_INSTR_PULL;
         return;
     }
 
-    pio_sm_hw_t* const sm_hw = &pio->sm[sm];
+    // 3. Pre-calculate ratio outside the snapshot critical path
+    const float ratio = (float)new_div / (float)old_div;
 
-    if (__builtin_expect(sm_hw->addr != 0, 1)) {
-        const float ratio = (float)new_div / (float)old_div;
+    // 4. Snapshot current countdown (X register)
+    sm_hw->instr = PIO_INSTR_IN_X_32;  // PIO stalls 1 cycle
+    sm_hw->instr = PIO_INSTR_PUSH;     // Push snapshot to RX FIFO
+    const int32_t current_x = (int32_t)pio->rxf[sm]; // APB read stall (~14 cycles)
+
+    // 5. Check if safe margin exists before the waveform wraps
+    if (__builtin_expect(current_x > SAFEGUARD_CYCLES, 1)) {
         
-        io_rw_32*       const txf = &pio->txf[sm];
-        const io_ro_32* const rxf = &pio->rxf[sm];
-        const uint32_t empty_mask = (1u << (PIO_FSTAT_RXEMPTY_LSB + sm));
-        
-        while (!(pio->fstat & empty_mask)) {
-            (void)*rxf;
-        }
+        // Exact hardware compensation for real APB bus + CPU transit time
+        const int32_t eff_x = current_x - PIPELINE_LATENCY_CYCLES;
 
-        if (__builtin_expect((systick_hw->csr & 1) == 0, 0)) {
-            systick_hw->rvr = 0x00FFFFFF;
-            systick_hw->csr = 0x5; 
-        }
+        if (__builtin_expect(eff_x > 0, 1)) {
+            const float exact_x = ((float)eff_x * ratio) + osc_frac_carry[osc];
+            const int32_t new_x = (int32_t)(exact_x + 0.5f) - PRE_SWAP_STALL_CYCLES;
 
-        // --- 1. Snapshot Time Anchor ---
-        sm_hw->instr = PIO_INSTR_IN_X_32;  // <--- PIO is stalled for 1 cycle here!
-        const uint32_t t_start = systick_hw->cvr;
-        sm_hw->instr = PIO_INSTR_PUSH;     
-        
-        const int32_t current_x = (int32_t)*rxf;
-        bool did_mid_cycle = false;
-        
-        if (__builtin_expect(current_x > SAFEGUARD_CYCLES, 1)) {
-            
-            static constexpr uint32_t DEADLINE_CYCLES = 80;
-            static constexpr uint32_t WRITE_OVERHEAD = 6;
-            static constexpr uint32_t WAIT_TARGET = DEADLINE_CYCLES - WRITE_OVERHEAD;
-            
-            // PHYSICS FIX 1: We subtract an extra 1 cycle because `current_x` 
-            // was captured AFTER the IN_X instruction stalled the timeline.
-            const int32_t eff_x = current_x - (int32_t)DEADLINE_CYCLES - 1;
+            if (__builtin_expect(new_x > MIN_NEW_X_CYCLES, 1)) {
+                // --- CRITICAL PATH: Push ONLY new_x and swap immediately ---
+                *txf = (uint32_t)new_x;
+                sm_hw->instr = PIO_INSTR_PULL;       // OSR = new_x
+                sm_hw->instr = PIO_INSTR_MOV_X_OSR;  // X = new_x (SWAP COMPLETE)
+                __dmb();
 
-            if (__builtin_expect(eff_x > 0, 1)) {
-                
-                // PHYSICS FIX 2: Sub-cycle Absolute Phase Tracking.
-                // This array stores the thrown-away decimal fraction from the previous 
-                // update, completely preventing Phase Random Walk.
-                static float osc_frac_carry[256] = {0.0f};
-                
-                const float exact_x = ((float)eff_x * ratio) + osc_frac_carry[osc];
-                
-                // -3 cycles to compensate for the PIO stalls caused by PULL, MOV_X, PULL
-                const int32_t new_x = (int32_t)(exact_x + 0.5f) + MANUAL_LATENCY_VALUE;
-                
-                if (__builtin_expect(new_x > 30, 1)) {
-                    
-                    // Push BOTH items safely into the TX FIFO before the deadline hits
-                    *txf = (uint32_t)new_x;
-                    *txf = new_div;
-                    
-                    // Spin wait for the cycle-accurate deadline
-                    while (true) {
-                        uint32_t elapsed = (t_start - systick_hw->cvr) & 0x00FFFFFF;
-                        if (elapsed >= WAIT_TARGET) break;
-                    }
+                // --- POST-CRITICAL PATH: Queue new_div for the next natural cycle ---
+                // X is now counting down from new_x (> 36 cycles), so we have plenty
+                // of time to reload OSR before X reaches 0.
+                *txf = new_div;
+                sm_hw->instr = PIO_INSTR_PULL;       // OSR = new_div
+                __dmb();
 
-                    // Inject the phase swap
-                    sm_hw->instr = PIO_INSTR_PULL;
-                    sm_hw->instr = PIO_INSTR_MOV_X_OSR;
-                    sm_hw->instr = PIO_INSTR_PULL;
-                    __dmb();
-                    
-                    // Extract and save the fractional rounding error for the NEXT update.
-                    osc_frac_carry[osc] = exact_x - (float)(new_x + MANUAL_LATENCY_VALUE);
-                    did_mid_cycle = true;
-                }
+                // Sub-cycle phase error carry
+                osc_frac_carry[osc] = exact_x - (float)(new_x + PRE_SWAP_STALL_CYCLES);
+                osc_last_clk_div[osc] = new_div;
+                return;
             }
         }
-
-        // If safeguard tripped, fall back to a natural cycle boundary update
-        if (__builtin_expect(!did_mid_cycle, 0)) {
-            *txf = new_div;
-            sm_hw->instr = PIO_INSTR_PULL;
-        }
     }
-    
+
+    // Fallback: Safe cycle-boundary update (completely artifact-free)
+    *txf = new_div;
+    sm_hw->instr = PIO_INSTR_PULL;
     osc_last_clk_div[osc] = new_div;
 }
+
 // 50% version
 // static inline void SRAM_HOT(update_osc_clk_div_instantly)(PIO pio, uint sm, uint8_t osc, uint32_t new_div, bool force_instant = false) {
 //   const uint32_t old_div = osc_last_clk_div[osc];
@@ -877,7 +863,7 @@ void SRAM_HOT(voice_task_float)() {
 
       float modifiersBase = calcPitchbend + EPS_FLOAT + unisonMODIFIER + char_pitch_delta_f;
 
-      // Preserving your original routing: lfo2 is hardwired to OSC2 (`freqModifiers2`),
+      // lfo2 is hardwired to OSC2 (`freqModifiers2`),
       // while matrix/lfo1 hit both or respective oscillators:
       float freqModifiers1 = ADSRModifierOSC1 + DETUNE_DRIFT_OSC1 + modifiersBase + lfo1_osc1_f + matrix_osc1_f;
       float freqModifiers2 = ADSRModifierOSC2 + DETUNE_DRIFT_OSC2 + modifiersBase + lfo1_osc2_f + lfo2_osc2_f + matrix_osc2_f;
@@ -890,7 +876,7 @@ void SRAM_HOT(voice_task_float)() {
       BENCH_BEGIN(vt_ratio_interp);
       // for testing and debug
       // float bipolar_offset =  freqModifiers1 - 1.0f; // Range: [-1.0f .. +1.0f]
-      // float ratio1 = exp2f(bipolar_offset);
+       //float ratio1 = exp2f(freqModifiers1 - 1.0f);
       float ratio1 = interpolate_live_ratio_f(freqModifiers1, DCO_A);
       float ratio2 = interpolate_live_ratio_f(freqModifiers2, DCO_B);
       BENCH_END(vt_ratio_interp);

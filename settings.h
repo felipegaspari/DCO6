@@ -44,7 +44,7 @@
 #define AMP_COMP_METHOD_DEFAULT 1  // FLOAT_QUAD (0); LUT=1, FIXED=2 — cmds 20–22
 #endif
 #ifndef CLKDIV_MODE
-#define CLKDIV_MODE CLKDIV_GOLD  // native Hz on float voice
+#define CLKDIV_MODE CLKDIV_FLOAT  // native Hz on float voice
 #endif
 #ifndef USE_FLOAT_CV_OUTS
 #define USE_FLOAT_CV_OUTS
