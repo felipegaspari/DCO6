@@ -82,6 +82,22 @@ void serial_send_preset_loaded_to_mb(uint8_t slot) {
 // Domain Block Senders (Preset Recall Burst)
 // =============================================================================
 
+void __not_in_flash_func(serial_send_preset_burst_to_mb)() {
+  serial_send_adsr_vca_block_to_mb();
+  serial_send_adsr_vcf_block_to_mb();
+  serial_send_adsr_dco_block_to_mb();
+  delayMicroseconds(10);  
+  serial_send_filter_block_to_mb();
+  delayMicroseconds(10);
+  serial_send_patch_osc_block_to_mb();
+  delayMicroseconds(10);
+  serial_send_patch_lfo_block_to_mb();
+  delayMicroseconds(10);
+  serial_send_patch_mod_block_to_mb();
+  delayMicroseconds(10);
+  serial_send_patch_mix_block_to_mb();
+}
+
 void __not_in_flash_func(serial_send_patch_osc_block_to_mb)() {
   PatchOscBlock blk;
   memset(&blk, 0, sizeof(blk));

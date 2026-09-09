@@ -434,129 +434,6 @@ static inline void SRAM_HOT(update_osc_clk_div_instantly)(PIO pio, uint sm, uint
     st->last_div = new_div;
     st->inv_div  = 1.0f / (float)new_div;
 }
-// 50% version
-// static inline void SRAM_HOT(update_osc_clk_div_instantly)(PIO pio, uint sm, uint8_t osc, uint32_t new_div, bool force_instant = false) {
-//   const uint32_t old_div = osc_last_clk_div[osc];
-  
-//   // Fast early-exit
-//   if (__builtin_expect(old_div == new_div, 1)) return;
-
-//   pio_sm_hw_t* const sm_hw = &pio->sm[sm];
-  
-//   // THRESHOLD: > 50% change is a discrete jump (Arp/Env). < 50% is continuous (FM/Vib).
-//   int32_t diff = (int32_t)new_div - (int32_t)old_div;
-//   bool massive_jump = abs(diff) > (old_div >> 1); 
-
-//   if (__builtin_expect(sm_hw->addr != 0, 1) && (massive_jump || force_instant)) {
-      
-//       // 1. DO HEAVY MATH FIRST!
-//       // This gets the variable-time float division OUT of the time-critical window.
-//       const float ratio = (float)new_div / (float)old_div;
-      
-//       io_rw_32*       const txf = &pio->txf[sm];
-//       const io_ro_32* const rxf = &pio->rxf[sm];
-//       const uint32_t empty_mask = (1u << (PIO_FSTAT_RXEMPTY_LSB + sm));
-      
-//       // Drain RX FIFO safely outside the critical section
-//       while (!(pio->fstat & empty_mask)) {
-//           (void)*rxf;
-//       }
-      
-//       // 2. CRITICAL SECTION (100% Deterministic Latency)
-//       // Locking interrupts guarantees the OS/USB can't pause the CPU here.
-//       // This locks our hardware latency to a microscopic ~60 nanoseconds.
-//       uint32_t irq = save_and_disable_interrupts();
-      
-//       sm_hw->instr = PIO_INSTR_IN_X_32;
-//       sm_hw->instr = PIO_INSTR_PUSH;
-      
-//       // x_now is EXACTLY how much time is left in the old frequency
-//       const int32_t x_now = (int32_t)*rxf;
-      
-//       // High-freq jitter protection (don't interrupt waves about to finish anyway)
-//       if (__builtin_expect(x_now > 500, 1)) { 
-          
-//           // 3. PERFECT STATIC LATENCY
-//           // Because interrupts are off and math is done, the CPU takes EXACTLY 
-//           // ~8 clock cycles to reach MOV_X_OSR. The PIO ticks in the OLD domain 
-//           // for those 8 cycles, so we subtract 8 BEFORE scaling!
-//           const int32_t new_x = (int32_t)((float)(x_now - 8) * ratio);
-          
-//           if (__builtin_expect(new_x > 20, 1)) {
-//               *txf = (uint32_t)new_x;
-//               sm_hw->instr = PIO_INSTR_PULL;
-//               sm_hw->instr = PIO_INSTR_MOV_X_OSR;
-//           }
-//       }
-      
-//       restore_interrupts(irq);
-//   }
-  
-//   // 4. Always queue standard FIFO push for continuous tracking
-//   pio->txf[sm] = new_div;
-//   pio->sm[sm].instr = PIO_INSTR_PULL;
-//   osc_last_clk_div[osc] = new_div;
-// }
-
-// ORIGINAL VERSION
-// static inline void SRAM_HOT(update_osc_clk_div_instantly)(PIO pio, uint sm, uint8_t osc, uint32_t new_div) {
-//   const uint32_t old_div = osc_last_clk_div[osc];
-  
-//   // Fast early-exit
-//   if (__builtin_expect(old_div == new_div, 1)) return;
-  
-//   pio_sm_hw_t* const sm_hw = &pio->sm[sm];
-  
-//   if (__builtin_expect(sm_hw->addr != 0, 1)) {
-  
-//   // 1. SUPERSCALAR LATENCY HIDING
-//     // Start the math NOW. The Cortex-M33 FPU takes 14 hardware cycles to do this.
-//     // It will process in the background, completely hiding the math execution time.
-//     const float ratio = (float)new_div / (float)old_div;
-    
-//     // Local register caching saves ~4 CPU cycles per read/write
-//     io_rw_32*       const txf = &pio->txf[sm];
-//     const io_ro_32* const rxf = &pio->rxf[sm];
-//     const uint32_t empty_mask = (1u << (PIO_FSTAT_RXEMPTY_LSB + sm));
-    
-//     // 2. SAFE RX DRAIN
-//     // We MUST do it this way. (Using FJOIN destroys the OSR and kills the sound).
-//     while (!(pio->fstat & empty_mask)) {
-//         (void)*rxf;
-//     }
-    
-//     // Command PIO to push X
-//     sm_hw->instr = PIO_INSTR_IN_X_32;
-//     sm_hw->instr = PIO_INSTR_PUSH;
-    
-//     // 3. THE HARDWARE STALL
-//     // The CPU will physically freeze here until the PIO state machine finishes the PUSH.
-//     // This accounts for nearly all of the 1.94 us execution time.
-//     const int32_t current_x = (int32_t)*rxf;
-    
-//     // Safeguard 1
-//     if (__builtin_expect(current_x > SAFEGUARD_CYCLES, 1)) {
-        
-//         // Math is instantaneous here because 'ratio' is already finished
-//         const int32_t new_x = (int32_t)((float)current_x * ratio) - BUS_LATENCY_CYCLES;
-        
-//         // Safeguard 2
-//         if (__builtin_expect(new_x > 30, 1)) {
-//             *txf = (uint32_t)new_x;
-//             sm_hw->instr = PIO_INSTR_PULL;
-//             sm_hw->instr = PIO_INSTR_MOV_X_OSR;
-//             __dmb(); // Restored barrier to protect PIO queue order
-//         }
-//     }
-  
-//   }
-  
-//   // 4. QUEUE STANDARD DIVIDER
-//   pio->txf[sm] = new_div;
-//   pio->sm[sm].instr = PIO_INSTR_PULL;
-//   osc_last_clk_div[osc] = new_div;
-//   }
-
 
 uint32_t get_osc_clk_div(uint8_t osc, float freqHz) {
   
@@ -672,11 +549,9 @@ void SRAM_HOT(voice_task_float)() {
   volatile uint8_t*      __restrict n_on_flag  = note_on_flag;
   volatile bool*         __restrict n_on_flag_f = note_on_flag_flag;
 
-  // 1. OSC Detune
-  const float osc1DetuneSteps = (float)((int32_t)OSC1_detune - 256);
-  const float osc1DetuneRatio = 1.0f + 0.0002f * osc1DetuneSteps;
-  const float osc2DetuneSteps = (float)((int32_t)OSC2_detune - 256);
-  const float osc2DetuneRatio = 1.0f + 0.0002f * osc2DetuneSteps;
+  const float masterTuning_local = masterTuning_f;
+  const float OSC1_detune_local  = OSC1_detune_f;
+  const float OSC2_detune_local  = OSC2_detune_f;
 
   // 2. Unison Base & Precalculated Weights (Scalable up to 16 voices)
   static constexpr float UNISON_SCALE = 0.0001f;
@@ -703,7 +578,7 @@ void SRAM_HOT(voice_task_float)() {
   const int32_t char_amp_mod_factor  = char_amp_scale_q15   ? character_amp_delta()         : 0;
 
   // Hoist loop-invariant additions out of the voice loop
-  const float global_mods = calcPitchbend + EPS_FLOAT + char_pitch_delta_f;
+  const float global_mods = calcPitchbend + EPS_FLOAT + char_pitch_delta_f + masterTuning_local;
   const int32_t base_pw_val = (int32_t)PW[0] + lfo2_pw_delta + char_pw_delta_i;
 
   // ADSR Routing flags (computed once outside the loop to eliminate branch mispredictions)
@@ -901,13 +776,13 @@ void SRAM_HOT(voice_task_float)() {
 
     // lfo2 is hardwired to OSC2 (`freqModifiers2`),
     // while matrix/lfo1 hit both or respective oscillators:
-    float freqModifiers1 = ADSRModifierOSC1 + DETUNE_DRIFT_OSC1 + modifiersBase + lfo1_osc1_f + matrix_osc1_f;
-    float freqModifiers2 = ADSRModifierOSC2 + DETUNE_DRIFT_OSC2 + modifiersBase + lfo1_osc2_f + lfo2_osc2_f + matrix_osc2_f;
+    float freqModifiers1 = ADSRModifierOSC1 + DETUNE_DRIFT_OSC1 + modifiersBase + lfo1_osc1_f + matrix_osc1_f + OSC1_detune_local;
+    float freqModifiers2 = ADSRModifierOSC2 + DETUNE_DRIFT_OSC2 + modifiersBase + lfo1_osc2_f + lfo2_osc2_f + matrix_osc2_f + OSC2_detune_local;
     BENCH_END(vt_modifiers);
 
 
-    BENCH_BEGIN(vt_freq_scale_x);
-    BENCH_END(vt_freq_scale_x);
+    // BENCH_BEGIN(vt_freq_scale_x);
+    // BENCH_END(vt_freq_scale_x);
 
     BENCH_BEGIN(vt_ratio_interp);
     // for testing and debug
@@ -918,8 +793,8 @@ void SRAM_HOT(voice_task_float)() {
     BENCH_END(vt_ratio_interp);
 
     BENCH_BEGIN(vt_freq_scale_post);
-    float freqA_Hz = freqA * (ratio1 * osc1DetuneRatio);
-    float freqB_Hz = freqB * (ratio2 * osc2DetuneRatio);
+    float freqA_Hz = freqA * ratio1;
+    float freqB_Hz = freqB * ratio2;
 
     #if DCO_DEBUG_REPORT
     dbg_freq_after_mod_Hz = freqA_Hz;

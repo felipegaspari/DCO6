@@ -24,13 +24,39 @@
  // 1. OSCILLATOR & VOICE CONFIGURATION APPLIERS
  // =============================================================================
 
+   // 1. Static Detune & Master Tune (Converted to Octaves)
+  // Maps 256 panel steps to exactly 1 Semitone (1/12th of an Octave)
+  #if defined(USE_FLOAT_VOICE_TASK)
+  static constexpr float DETUNE_OCT_SCALE = 1.0f / (12.0f * 256.0f); // ~0.00032552f
+  #else
+  static constexpr int32_t DETUNE_OCT_SCALE = 65664; // ~0.00032552f * 32768
+  #endif
+
  static void SRAM_HOT(apply_param_osc1_pulse_enable)(int16_t v) { pulseWaveOn = (v != 0); }
  static void SRAM_HOT(apply_param_osc1_interval)(int16_t v) { octave_shift = (int8_t)v; }
  static void SRAM_HOT(apply_param_osc2_interval)(int16_t v) { OSC2_interval = (int8_t)v; }
  static void SRAM_HOT(apply_param_osc3_interval)(int16_t v) { OSC3_interval = (int8_t)v; }
- static void SRAM_HOT(apply_param_master_tuning)(int16_t v) { masterTuning = (uint16_t)v; }
- static void SRAM_HOT(apply_param_osc1_detune)(int16_t v) { OSC1_detune = (uint16_t)v; }
- static void SRAM_HOT(apply_param_osc2_detune)(int16_t v) { OSC2_detune = (uint16_t)v; }
+ static void SRAM_HOT(apply_param_master_tuning)(int16_t v) { masterTuning = (uint16_t)v;
+ #if defined(USE_FLOAT_VOICE_TASK)
+   masterTuning_f = (float)((int32_t)masterTuning - 256) * DETUNE_OCT_SCALE;
+ #else
+   masterTuning_q24 = (int32_t)masterTuning * DETUNE_OCT_SCALE;
+ #endif
+ }
+ static void SRAM_HOT(apply_param_osc1_detune)(int16_t v) { OSC1_detune = (uint16_t)v; 
+ #if defined(USE_FLOAT_VOICE_TASK)
+   OSC1_detune_f = (float)((int32_t)OSC1_detune - 256) * DETUNE_OCT_SCALE;
+ #else
+   OSC1_detune_q24 = (int32_t)OSC1_detune * DETUNE_OCT_SCALE;
+ #endif
+ }
+ static void SRAM_HOT(apply_param_osc2_detune)(int16_t v) { OSC2_detune = (uint16_t)v; 
+ #if defined(USE_FLOAT_VOICE_TASK)
+   OSC2_detune_f = (float)((int32_t)OSC2_detune - 256) * DETUNE_OCT_SCALE;
+ #else
+   OSC2_detune_q24 = (int32_t)OSC2_detune * DETUNE_OCT_SCALE;
+ #endif
+ }
  static void SRAM_HOT(apply_param_osc3_detune)(int16_t /*v*/) { /* DCO3 monosynth only */ }
  static void SRAM_HOT(apply_param_unison_detune)(int16_t v) { unisonDetune = v; }
  
@@ -928,177 +954,194 @@ static void SRAM_HOT(apply_param_adsr3_release)(int16_t v) { ADSR3_release = (ui
  }
 
 
-  // =============================================================================
- // PRESET SHADOW APPLIER (Recall State from RAM Buffer)
- // =============================================================================
- 
- /**
-  * @brief Applies an entire preset from the RAM shadow array to the synth engine.
-  */
-  void SRAM_HOT(dco_apply_preset_shadow)() {
-    // =========================================================================
-    // 1. Oscillator & Voice Configuration
-    // =========================================================================
-    
-    pulseWaveOn       = (presetParamShadow[PARAM_OSC1_PULSE_ENABLE] != 0);
-    octave_shift      = (int8_t)presetParamShadow[PARAM_OSC1_INTERVAL];
-    OSC2_interval     = (int8_t)presetParamShadow[PARAM_OSC2_INTERVAL];
-    OSC3_interval     = (int8_t)presetParamShadow[PARAM_OSC3_INTERVAL];
-    OSC1_detune       = (uint16_t)presetParamShadow[PARAM_OSC1_DETUNE_VAL];
-    OSC2_detune       = (uint16_t)presetParamShadow[PARAM_OSC2_DETUNE_VAL];
-    unisonDetune      = presetParamShadow[PARAM_UNISON_DETUNE];
-    masterTuning      = (uint16_t)presetParamShadow[PARAM_MASTER_TUNING];
+// =============================================================================
+// PRESET SHADOW APPLIER (Recall State from RAM Buffer)
+// =============================================================================
+
+/**
+ * @brief FAST PHASE: Pulls raw state into variables to guarantee block senders have accurate data.
+ * Zero floating-point math. Zero complex loops.
+ */
+ void SRAM_HOT(dco_preset_assign_state)() {
+  pulseWaveOn       = (presetParamShadow[PARAM_OSC1_PULSE_ENABLE] != 0);
+  octave_shift      = (int8_t)presetParamShadow[PARAM_OSC1_INTERVAL];
+  OSC2_interval     = (int8_t)presetParamShadow[PARAM_OSC2_INTERVAL];
+  OSC3_interval     = (int8_t)presetParamShadow[PARAM_OSC3_INTERVAL];
+  OSC1_detune       = (uint16_t)presetParamShadow[PARAM_OSC1_DETUNE_VAL];
+  OSC2_detune       = (uint16_t)presetParamShadow[PARAM_OSC2_DETUNE_VAL];
+  unisonDetune      = presetParamShadow[PARAM_UNISON_DETUNE];
+  masterTuning      = (uint16_t)presetParamShadow[PARAM_MASTER_TUNING];
+
+  portamento_mode   = (uint8_t)presetParamShadow[PARAM_PORTAMENTO_MODE];
+
+  voiceMode         = (uint8_t)presetParamShadow[PARAM_VOICE_MODE];
+  setVoiceMode(voiceMode);
+  voiceAlloc.setMode((uint8_t)presetParamShadow[PARAM_VOICE_ALLOC_MODE]);
   
-    apply_param_portamento_time((uint16_t)presetParamShadow[PARAM_PORTAMENTO_TIME]);
-    portamento_mode   = (uint8_t)presetParamShadow[PARAM_PORTAMENTO_MODE];
+  softSyncChunks    = (uint8_t)presetParamShadow[PARAM_SOFT_SYNC];
+  syncMode          = (uint8_t)presetParamShadow[PARAM_SYNC_MODE];
+  setSyncMode();
   
-    voiceMode         = (uint8_t)presetParamShadow[PARAM_VOICE_MODE];
-    setVoiceMode(voiceMode);
-    voiceAlloc.setMode((uint8_t)presetParamShadow[PARAM_VOICE_ALLOC_MODE]);
-    
-    softSyncChunks    = (uint8_t)presetParamShadow[PARAM_SOFT_SYNC];
-    syncMode          = (uint8_t)presetParamShadow[PARAM_SYNC_MODE];
-    setSyncMode();
-    apply_param_phase_align((int16_t)presetParamShadow[PARAM_OSC_PHASE_SYNC]);
-    subOscDivide      = (uint8_t)presetParamShadow[PARAM_SUBOSC_DIVIDE];
-    crossmod_depth    = (uint16_t)presetParamShadow[PARAM_CROSSMOD_DEPTH];
-    crossmod_mode      = (uint8_t)presetParamShadow[PARAM_CROSSMOD_MODE];
-    update_crossmod_prebake(crossmod_depth);
-  
-    // =========================================================================
-    // 2. LFO Speeds, Waveforms & Frequencies
-    // =========================================================================
-    LFO1Waveform      = (uint8_t)presetParamShadow[PARAM_LFO1_WAVEFORM];
-    LFO1_class.setWaveForm(LFO1Waveform);
-  
-    LFO2Waveform      = (uint8_t)presetParamShadow[PARAM_LFO2_WAVEFORM];
-    LFO2_class.setWaveForm(LFO2Waveform);
-  
-    const uint32_t now_us = micros();
-    LFO1SpeedVal      = (uint16_t)presetParamShadow[PARAM_LFO1_SPEED];
-    LFO1Speed         = fast_exp_speed_5000(LFO1SpeedVal);
-    LFO1_class.setMode0Freq(LFO1Speed, now_us);
-  
-    LFO2SpeedVal      = (uint16_t)presetParamShadow[PARAM_LFO2_SPEED];
-    LFO2Speed         = fast_exp_speed_5000(LFO2SpeedVal);
-    LFO2_class.setMode0Freq(LFO2Speed, now_us);
-  
-// =========================================================================
-    // 3. LFO Pitch Depths (Q24 Math & Float)
-    // =========================================================================
-    LFO1toDCOVal = (uint16_t)constrain(presetParamShadow[PARAM_LFO1_TO_DCO], 0, 511);
-#if defined(USE_FLOAT_VOICE_TASK)
-    LFO1toDCO_f           = lfo_pitch_depth_f(fast_lfo_depth_norm<511>(LFO1toDCOVal), LFO_4_OCTAVES);
-    LFO1toOSC1_f          = lfo_pitch_depth_f(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO1_TO_OSC1], 0, 255)), LFO_4_OCTAVES);
-    LFO1toOSC2_f          = lfo_pitch_depth_f(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO1_TO_OSC2], 0, 255)), LFO_4_OCTAVES);
-    LFO1toOSC3_f          = lfo_pitch_depth_f(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO1_TO_OSC3], 0, 255)), LFO_4_OCTAVES);
-    LFO2toOSC2_f          = lfo_pitch_depth_f(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC2], 0, 255)), LFO_VIBRATO_2_SEMITONES);
-    LFO2toOSC3_f          = lfo_pitch_depth_f(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC3], 0, 255)), LFO_VIBRATO_2_SEMITONES);
-    LFO2toOSC2_coarse_f   = lfo_pitch_depth_f(fast_lfo_depth_norm<511>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC2_COARSE], 0, 511)), LFO_4_OCTAVES);
-    LFO2toOSC3_coarse_f   = lfo_pitch_depth_f(fast_lfo_depth_norm<511>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC3_COARSE], 0, 511)), LFO_4_OCTAVES);
-#else
-    LFO1toDCO_q24         = lfo_pitch_depth_q24(fast_lfo_depth_norm<511>(LFO1toDCOVal), LFO_COARSE_2_OCTAVES_Q24);
-    LFO1toOSC1_q24        = lfo_pitch_depth_q24(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO1_TO_OSC1], 0, 255)), LFO_COARSE_2_OCTAVES_Q24);
-    LFO1toOSC2_q24        = lfo_pitch_depth_q24(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO1_TO_OSC2], 0, 255)), LFO_COARSE_2_OCTAVES_Q24);
-    LFO1toOSC3_q24        = lfo_pitch_depth_q24(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO1_TO_OSC3], 0, 255)), LFO_COARSE_2_OCTAVES_Q24);
-    LFO2toOSC2_q24        = lfo_pitch_depth_q24(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC2], 0, 255)), LFO_VIBRATO_2_SEMITONES_Q24);
-    LFO2toOSC3_q24        = lfo_pitch_depth_q24(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC3], 0, 255)), LFO_VIBRATO_2_SEMITONES_Q24);
-    LFO2toOSC2_coarse_q24 = lfo_pitch_depth_q24(fast_lfo_depth_norm<511>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC2_COARSE], 0, 511)), LFO_COARSE_2_OCTAVES_Q24);
-    LFO2toOSC3_coarse_q24 = lfo_pitch_depth_q24(fast_lfo_depth_norm<511>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC3_COARSE], 0, 511)), LFO_COARSE_2_OCTAVES_Q24);
-#endif
-  
-    // ADSR3 Detune
-    ADSR3toDETUNE1           = presetParamShadow[PARAM_ADSR3_TO_DETUNE1];
+  subOscDivide      = (uint8_t)presetParamShadow[PARAM_SUBOSC_DIVIDE];
+  crossmod_depth    = (uint16_t)presetParamShadow[PARAM_CROSSMOD_DEPTH];
+  crossmod_mode     = (uint8_t)presetParamShadow[PARAM_CROSSMOD_MODE];
+
+  LFO1Waveform      = (uint8_t)presetParamShadow[PARAM_LFO1_WAVEFORM];
+  LFO1_class.setWaveForm(LFO1Waveform);
+
+  LFO2Waveform      = (uint8_t)presetParamShadow[PARAM_LFO2_WAVEFORM];
+  LFO2_class.setWaveForm(LFO2Waveform);
+
+  PW[0] = presetParamShadow[PARAM_PW_VALUE] >> 1;
+
+  ADSR3ToOscSelect  = (int8_t)presetParamShadow[PARAM_ADSR3_TO_OSC_SELECT];
+  ADSR3Mode         = (uint8_t)presetParamShadow[PARAM_ADSR3_MODE];
+  ADSR2Mode         = (uint8_t)presetParamShadow[PARAM_ADSR2_MODE];
+  ADSR1Mode         = (uint8_t)presetParamShadow[PARAM_ADSR1_MODE];
+
+  ADSR3Restart = (uint8_t)presetParamShadow[PARAM_ADSR3_RESTART];
+  ADSR2Restart = (uint8_t)presetParamShadow[PARAM_ADSR2_RESTART];
+  ADSR1Restart = (uint8_t)presetParamShadow[PARAM_ADSR1_RESTART];
+
+  ADSR1AttackCurveVal  = (uint8_t)presetParamShadow[PARAM_ADSR1_ATTACK_CURVE];
+  ADSR1DecayCurveVal   = (uint8_t)presetParamShadow[PARAM_ADSR1_DECAY_CURVE];
+  ADSR1ReleaseCurveVal = (uint8_t)presetParamShadow[PARAM_ADSR1_RELEASE_CURVE];
+  ADSR_VCA_change_attack_curve(ADSR1AttackCurveVal);
+  ADSR_VCA_change_decay_curve(ADSR1DecayCurveVal);
+  ADSR_VCA_change_release_curve(ADSR1ReleaseCurveVal);
+
+  ADSR2AttackCurveVal  = (uint8_t)presetParamShadow[PARAM_ADSR2_ATTACK_CURVE];
+  ADSR2DecayCurveVal   = (uint8_t)presetParamShadow[PARAM_ADSR2_DECAY_CURVE];
+  ADSR2ReleaseCurveVal = (uint8_t)presetParamShadow[PARAM_ADSR2_RELEASE_CURVE];
+  ADSR_VCF_change_attack_curve(ADSR2AttackCurveVal);
+  ADSR_VCF_change_decay_curve(ADSR2DecayCurveVal);
+  ADSR_VCF_change_release_curve(ADSR2ReleaseCurveVal);
+  ADSR_VCF2_change_attack_curve(ADSR2AttackCurveVal);
+  ADSR_VCF2_change_decay_curve(ADSR2DecayCurveVal);
+  ADSR_VCF2_change_release_curve(ADSR2ReleaseCurveVal);
+
+  ADSR3AttackCurveVal  = (uint8_t)presetParamShadow[PARAM_ADSR3_ATTACK_CURVE];
+  ADSR3DecayCurveVal   = (uint8_t)presetParamShadow[PARAM_ADSR3_DECAY_CURVE];
+  ADSR3ReleaseCurveVal = (uint8_t)presetParamShadow[PARAM_ADSR3_RELEASE_CURVE];
+  ADSR3_change_attack_curve(ADSR3AttackCurveVal);
+  ADSR3_change_decay_curve(ADSR3DecayCurveVal);
+  ADSR3_change_release_curve(ADSR3ReleaseCurveVal);
+
+  set_vcf_trigger_mode((uint8_t)presetParamShadow[PARAM_VCF_TRIGGER_MODE]);
+
+  CUTOFF     = (uint16_t)presetParamShadow[PARAM_VCF_CUTOFF];
+  RESONANCE  = (uint16_t)presetParamShadow[PARAM_VCF_RESONANCE];
+  ADSR2toVCF = presetParamShadow[PARAM_ADSR2_TO_VCF];
+  LFO2toVCF  = (uint16_t)presetParamShadow[PARAM_LFO2_TO_VCF];
+
+  ADSR_VCA_attack  = (uint16_t)presetParamShadow[PARAM_ADSR1_ATTACK];
+  ADSR_VCA_decay   = (uint16_t)presetParamShadow[PARAM_ADSR1_DECAY];
+  ADSR_VCA_sustain = (uint16_t)presetParamShadow[PARAM_ADSR1_SUSTAIN];
+  ADSR_VCA_release = (uint16_t)presetParamShadow[PARAM_ADSR1_RELEASE];
+
+  ADSR_VCF_attack  = (uint16_t)presetParamShadow[PARAM_ADSR2_ATTACK];
+  ADSR_VCF_decay   = (uint16_t)presetParamShadow[PARAM_ADSR2_DECAY];
+  ADSR_VCF_sustain = (uint16_t)presetParamShadow[PARAM_ADSR2_SUSTAIN];
+  ADSR_VCF_release = (uint16_t)presetParamShadow[PARAM_ADSR2_RELEASE];
+
+  ADSR3_attack     = (uint16_t)presetParamShadow[PARAM_ADSR3_ATTACK];
+  ADSR3_decay      = (uint16_t)presetParamShadow[PARAM_ADSR3_DECAY];
+  ADSR3_sustain    = (uint16_t)presetParamShadow[PARAM_ADSR3_SUSTAIN];
+  ADSR3_release    = (uint16_t)presetParamShadow[PARAM_ADSR3_RELEASE];
+
+  analogDrift       = presetParamShadow[PARAM_ANALOG_DRIFT_AMOUNT];
+  analogDriftSpeed  = presetParamShadow[PARAM_ANALOG_DRIFT_SPEED];
+  analogDriftSpread = presetParamShadow[PARAM_ANALOG_DRIFT_SPREAD];
+  character         = (uint8_t)constrain(presetParamShadow[PARAM_CHARACTER], 0, 128);
+
+  mark_adsr_params_dirty(ADSR_DIRTY_VCA_ALL | ADSR_DIRTY_VCF_ALL | ADSR_DIRTY_DCO_ALL);
+}
+
+/**
+ * @brief SLOW PHASE: Heavy float math, scale precomputing, and jump-table routing.
+ * Runs concurrently while the DMA controller streams the parameter blocks.
+ */
+void SRAM_HOT(dco_preset_prebake)() {
+  // 1. Static Detune & Master Tune (Converted to Octaves)
+  // Maps 256 panel steps to exactly 1 Semitone (1/12th of an Octave)
   #if defined(USE_FLOAT_VOICE_TASK)
-    ADSR3toDETUNE1_scale_f   = (float)ADSR3toDETUNE1 * (2.0f / (511.0f * 32768.0f));
+  masterTuning_f = (float)((int32_t)masterTuning - 256) * DETUNE_OCT_SCALE;
+  OSC1_detune_f = (float)((int32_t)OSC1_detune - 256)   * DETUNE_OCT_SCALE;
+  OSC2_detune_f = (float)((int32_t)OSC2_detune - 256)   * DETUNE_OCT_SCALE;
   #else
-    ADSR3toDETUNE1_scale_q24 = (int32_t)ADSR3toDETUNE1 * 65664;
+  masterTuning_q24 = (int32_t)masterTuning * DETUNE_OCT_SCALE;
+  OSC1_detune_q24 = (int32_t)OSC1_detune   * DETUNE_OCT_SCALE;
+  OSC2_detune_q24 = (int32_t)OSC2_detune   * DETUNE_OCT_SCALE;
   #endif
-  
-    LFO2toPW          = (uint16_t)(((uint32_t)presetParamShadow[PARAM_LFO2_TO_PW] * DIV_COUNTER_PW) / 1024);
 
-    // =========================================================================
-    // 4. Analog Drift, Pulse Width & Character
-    // =========================================================================
-    apply_param_analog_drift_amount(presetParamShadow[PARAM_ANALOG_DRIFT_AMOUNT]);
-    apply_param_analog_drift_speed(presetParamShadow[PARAM_ANALOG_DRIFT_SPEED]);
-    apply_param_analog_drift_spread(presetParamShadow[PARAM_ANALOG_DRIFT_SPREAD]);
-    init_DRIFT_LFOs();
-  
-    PW[0] = presetParamShadow[PARAM_PW_VALUE] >> 1;
-  
-   // =========================================================================
-   // 5. Envelope Modulations, Curves & Filter Trigger Mode
-   // =========================================================================
-   ADSR3ToOscSelect         = (int8_t)presetParamShadow[PARAM_ADSR3_TO_OSC_SELECT];
-   ADSR3toPWM = (int16_t)(((int32_t)(presetParamShadow[PARAM_ADSR3_TO_PWM] - 512) * (int32_t)DIV_COUNTER_PW) / 1024);
-   ADSR3toPWM_scale = ADSR3toPWM;
-   ADSR3toDETUNE1           = presetParamShadow[PARAM_ADSR3_TO_DETUNE1];
-   ADSR3toDETUNE1_scale_q24 = (int32_t)presetParamShadow[PARAM_ADSR3_TO_DETUNE1] * 65664;
-   
-   ADSR3Mode                = (uint8_t)presetParamShadow[PARAM_ADSR3_MODE];
-   ADSR2Mode                = (uint8_t)presetParamShadow[PARAM_ADSR2_MODE];
-   ADSR1Mode                = (uint8_t)presetParamShadow[PARAM_ADSR1_MODE];
- 
-   ADSR3Restart = (uint8_t)presetParamShadow[PARAM_ADSR3_RESTART];
-   ADSR2Restart = (uint8_t)presetParamShadow[PARAM_ADSR2_RESTART];
-   ADSR1Restart = (uint8_t)presetParamShadow[PARAM_ADSR1_RESTART];
- 
-   // 1. Apply VCA Curves (ADSR1)
-   ADSR1AttackCurveVal  = (uint8_t)presetParamShadow[PARAM_ADSR1_ATTACK_CURVE];
-   ADSR1DecayCurveVal   = (uint8_t)presetParamShadow[PARAM_ADSR1_DECAY_CURVE];
-   ADSR1ReleaseCurveVal = (uint8_t)presetParamShadow[PARAM_ADSR1_RELEASE_CURVE];
-   ADSR_VCA_change_attack_curve(ADSR1AttackCurveVal);
-   ADSR_VCA_change_decay_curve(ADSR1DecayCurveVal);
-   ADSR_VCA_change_release_curve(ADSR1ReleaseCurveVal);
- 
-   // 2. Apply VCF Curves (ADSR2 -> VCF1 & VCF2)
-   ADSR2AttackCurveVal  = (uint8_t)presetParamShadow[PARAM_ADSR2_ATTACK_CURVE];
-   ADSR2DecayCurveVal   = (uint8_t)presetParamShadow[PARAM_ADSR2_DECAY_CURVE];
-   ADSR2ReleaseCurveVal = (uint8_t)presetParamShadow[PARAM_ADSR2_RELEASE_CURVE];
-   ADSR_VCF_change_attack_curve(ADSR2AttackCurveVal);
-   ADSR_VCF_change_decay_curve(ADSR2DecayCurveVal);
-   ADSR_VCF_change_release_curve(ADSR2ReleaseCurveVal);
-   ADSR_VCF2_change_attack_curve(ADSR2AttackCurveVal);
-   ADSR_VCF2_change_decay_curve(ADSR2DecayCurveVal);
-   ADSR_VCF2_change_release_curve(ADSR2ReleaseCurveVal);
- 
-   // 3. Apply DCO Curves (ADSR3)
-   ADSR3AttackCurveVal  = (uint8_t)presetParamShadow[PARAM_ADSR3_ATTACK_CURVE];
-   ADSR3DecayCurveVal   = (uint8_t)presetParamShadow[PARAM_ADSR3_DECAY_CURVE];
-   ADSR3ReleaseCurveVal = (uint8_t)presetParamShadow[PARAM_ADSR3_RELEASE_CURVE];
-   ADSR3_change_attack_curve(ADSR3AttackCurveVal);
-   ADSR3_change_decay_curve(ADSR3DecayCurveVal);
-   ADSR3_change_release_curve(ADSR3ReleaseCurveVal);
- 
-   // 4. Apply Shared Filter Trigger Mode (Legato / Multi / Direct)
-   set_vcf_trigger_mode((uint8_t)presetParamShadow[PARAM_VCF_TRIGGER_MODE]);
+  apply_param_portamento_time((uint16_t)presetParamShadow[PARAM_PORTAMENTO_TIME]);
+  apply_param_phase_align((int16_t)presetParamShadow[PARAM_OSC_PHASE_SYNC]);
+  update_crossmod_prebake(crossmod_depth);
 
-   // =========================================================================
-    // Filter & Envelope Times (Loaded from presetParamShadow)
-    // =========================================================================
-    CUTOFF     = (uint16_t)presetParamShadow[PARAM_VCF_CUTOFF];
-    RESONANCE  = (uint16_t)presetParamShadow[PARAM_VCF_RESONANCE];
-    ADSR2toVCF = presetParamShadow[PARAM_ADSR2_TO_VCF];
-    LFO2toVCF  = (uint16_t)presetParamShadow[PARAM_LFO2_TO_VCF];
-    cv_bake_adsr2_to_vcf_scale();
-    cv_bake_lfo2_to_vcf_scale();
+  const uint32_t now_us = micros();
+  LFO1SpeedVal      = (uint16_t)presetParamShadow[PARAM_LFO1_SPEED];
+  LFO1Speed         = fast_exp_speed_5000(LFO1SpeedVal);
+  LFO1_class.setMode0Freq(LFO1Speed, now_us);
 
-    ADSR_VCA_attack  = (uint16_t)presetParamShadow[PARAM_ADSR1_ATTACK];
-    ADSR_VCA_decay   = (uint16_t)presetParamShadow[PARAM_ADSR1_DECAY];
-    ADSR_VCA_sustain = (uint16_t)presetParamShadow[PARAM_ADSR1_SUSTAIN];
-    ADSR_VCA_release = (uint16_t)presetParamShadow[PARAM_ADSR1_RELEASE];
+  LFO2SpeedVal      = (uint16_t)presetParamShadow[PARAM_LFO2_SPEED];
+  LFO2Speed         = fast_exp_speed_5000(LFO2SpeedVal);
+  LFO2_class.setMode0Freq(LFO2Speed, now_us);
 
-    ADSR_VCF_attack  = (uint16_t)presetParamShadow[PARAM_ADSR2_ATTACK];
-    ADSR_VCF_decay   = (uint16_t)presetParamShadow[PARAM_ADSR2_DECAY];
-    ADSR_VCF_sustain = (uint16_t)presetParamShadow[PARAM_ADSR2_SUSTAIN];
-    ADSR_VCF_release = (uint16_t)presetParamShadow[PARAM_ADSR2_RELEASE];
+  LFO1toDCOVal = (uint16_t)constrain(presetParamShadow[PARAM_LFO1_TO_DCO], 0, 511);
+#if defined(USE_FLOAT_VOICE_TASK)
+  LFO1toDCO_f           = lfo_pitch_depth_f(fast_lfo_depth_norm<511>(LFO1toDCOVal), LFO_4_OCTAVES);
+  LFO1toOSC1_f          = lfo_pitch_depth_f(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO1_TO_OSC1], 0, 255)), LFO_4_OCTAVES);
+  LFO1toOSC2_f          = lfo_pitch_depth_f(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO1_TO_OSC2], 0, 255)), LFO_4_OCTAVES);
+  LFO1toOSC3_f          = lfo_pitch_depth_f(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO1_TO_OSC3], 0, 255)), LFO_4_OCTAVES);
+  LFO2toOSC2_f          = lfo_pitch_depth_f(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC2], 0, 255)), LFO_VIBRATO_2_SEMITONES);
+  LFO2toOSC3_f          = lfo_pitch_depth_f(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC3], 0, 255)), LFO_VIBRATO_2_SEMITONES);
+  LFO2toOSC2_coarse_f   = lfo_pitch_depth_f(fast_lfo_depth_norm<511>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC2_COARSE], 0, 511)), LFO_4_OCTAVES);
+  LFO2toOSC3_coarse_f   = lfo_pitch_depth_f(fast_lfo_depth_norm<511>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC3_COARSE], 0, 511)), LFO_4_OCTAVES);
+#else
+  LFO1toDCO_q24         = lfo_pitch_depth_q24(fast_lfo_depth_norm<511>(LFO1toDCOVal), LFO_COARSE_2_OCTAVES_Q24);
+  LFO1toOSC1_q24        = lfo_pitch_depth_q24(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO1_TO_OSC1], 0, 255)), LFO_COARSE_2_OCTAVES_Q24);
+  LFO1toOSC2_q24        = lfo_pitch_depth_q24(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO1_TO_OSC2], 0, 255)), LFO_COARSE_2_OCTAVES_Q24);
+  LFO1toOSC3_q24        = lfo_pitch_depth_q24(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO1_TO_OSC3], 0, 255)), LFO_COARSE_2_OCTAVES_Q24);
+  LFO2toOSC2_q24        = lfo_pitch_depth_q24(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC2], 0, 255)), LFO_VIBRATO_2_SEMITONES_Q24);
+  LFO2toOSC3_q24        = lfo_pitch_depth_q24(fast_lfo_depth_norm<255>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC3], 0, 255)), LFO_VIBRATO_2_SEMITONES_Q24);
+  LFO2toOSC2_coarse_q24 = lfo_pitch_depth_q24(fast_lfo_depth_norm<511>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC2_COARSE], 0, 511)), LFO_COARSE_2_OCTAVES_Q24);
+  LFO2toOSC3_coarse_q24 = lfo_pitch_depth_q24(fast_lfo_depth_norm<511>((uint16_t)constrain(presetParamShadow[PARAM_LFO2_TO_OSC3_COARSE], 0, 511)), LFO_COARSE_2_OCTAVES_Q24);
+#endif
 
-    ADSR3_attack     = (uint16_t)presetParamShadow[PARAM_ADSR3_ATTACK];
-    ADSR3_decay      = (uint16_t)presetParamShadow[PARAM_ADSR3_DECAY];
-    ADSR3_sustain    = (uint16_t)presetParamShadow[PARAM_ADSR3_SUSTAIN];
-    ADSR3_release    = (uint16_t)presetParamShadow[PARAM_ADSR3_RELEASE];
+  ADSR3toDETUNE1           = presetParamShadow[PARAM_ADSR3_TO_DETUNE1];
+#if defined(USE_FLOAT_VOICE_TASK)
+  ADSR3toDETUNE1_scale_f   = (float)ADSR3toDETUNE1 * (2.0f / (511.0f * 32768.0f));
+  drift_pitch_scale_f      = (float)analogDrift * ((0.0000005f * 1000.0f) / 32768.0f);
+#else
+  ADSR3toDETUNE1_scale_q24 = (int32_t)ADSR3toDETUNE1 * 65664;
+#endif
 
-    mark_adsr_params_dirty(ADSR_DIRTY_VCA_ALL | ADSR_DIRTY_VCF_ALL | ADSR_DIRTY_DCO_ALL);
- 
+  LFO2toPW = (uint16_t)(((uint32_t)presetParamShadow[PARAM_LFO2_TO_PW] * DIV_COUNTER_PW) / 1024);
+
+  bake_drift_lfo_frequencies(); 
+
+  ADSR3toPWM = (int16_t)(((int32_t)(presetParamShadow[PARAM_ADSR3_TO_PWM] - 512) * (int32_t)DIV_COUNTER_PW) / 1024);
+  ADSR3toPWM_scale = ADSR3toPWM;
+
+  cv_bake_adsr2_to_vcf_scale();
+  cv_bake_lfo2_to_vcf_scale();
+  character_recompute_scales();
+
+  for (uint8_t i = 0; i < 8; i++) {
+    uint8_t srcId   = PARAM_MOD_SLOT0_SOURCE + (i * 3);
+    uint8_t destId  = PARAM_MOD_SLOT0_DEST   + (i * 3);
+    uint8_t depthId = PARAM_MOD_SLOT0_DEPTH  + (i * 3);
+
+    if (dcoParamJump[srcId])   dcoParamJump[srcId](presetParamShadow[srcId]);
+    if (dcoParamJump[destId])  dcoParamJump[destId](presetParamShadow[destId]);
+    if (dcoParamJump[depthId]) dcoParamJump[depthId](presetParamShadow[depthId]);
   }
+}
+
+/**
+ * @brief Backwards-compatible wrapper just in case other routines call the old function.
+ */
+void SRAM_HOT(dco_apply_preset_shadow)() {
+  dco_preset_assign_state();
+  dco_preset_prebake();
+}

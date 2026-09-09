@@ -354,6 +354,16 @@ uint16_t OSC1_detune = 127;
 uint16_t OSC2_detune = 127;
 uint16_t OSC3_detune = 127;
 
+#if defined(USE_FLOAT_VOICE_TASK)
+float masterTuning_f = 0.0f;
+float OSC1_detune_f = 0.0f;
+float OSC2_detune_f = 0.0f;
+#else
+int32_t masterTuning_q24 = 0;
+int32_t OSC1_detune_q24 = 0;
+int32_t OSC2_detune_q24 = 0;
+#endif
+
 bool PWMPotsControlManual;
 
 uint16_t PW[NUM_PW_CHANNELS];  // panel / mod PW target per voice

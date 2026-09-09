@@ -193,28 +193,18 @@ static void preset_record_build(uint8_t* buf) {
 }
 
 static void __not_in_flash_func(preset_record_apply)(const uint8_t* buf) {
-  // 1. Direct restore from flash into RAM shadow
+  // 1. Restore from flash into RAM shadow
   memcpy(presetParamShadow, buf + PRESET_OFF_PARAMS, sizeof(presetParamShadow));
   memcpy(presetParamSetBitmap, buf + PRESET_OFF_BITMAP, sizeof(presetParamSetBitmap));
 
-  // 2. Transmit burst updates to Mainboard using the freshly unpacked shadow values
-  serial_send_adsr_vca_block_to_mb();
-  serial_send_adsr_vcf_block_to_mb();
-  serial_send_adsr_dco_block_to_mb();
-  serial_send_filter_block_to_mb();
-  serial_dma_poll_one(0);
-  serial_send_patch_osc_block_to_mb();
-  serial_send_patch_lfo_block_to_mb();
-  serial_dma_poll_one(0);
-  serial_send_patch_mod_block_to_mb();
-  serial_send_patch_mix_block_to_mb();
+  // 2. Fast global variable assignment (guarantees CUTOFF, Envelopes etc. are accurate)
+  dco_preset_assign_state();
 
+  // 3. IMMEDIATELY blast data across the wire (highest priority for fast loading)
+  serial_send_preset_burst_to_mb();
 
-  // 3. Apply local DCO engine state and bake filter/envelope scales
-  dco_apply_preset_shadow();
-  mark_adsr_params_dirty(ADSR_DIRTY_VCA_ALL | ADSR_DIRTY_VCF_ALL | ADSR_DIRTY_DCO_ALL);
-  cv_bake_adsr2_to_vcf_scale();
-  cv_bake_lfo2_to_vcf_scale();
+  // 4. Concurrently execute the slow float math, LFO scales, and Mod Matrix routines
+  dco_preset_prebake();
 }
 
 static bool preset_record_validate(const uint8_t* buf) {

@@ -42,5 +42,8 @@ void SRAM_HOT(serial_send_expression)();
 void SRAM_HOT(serial_send_patch_osc_block_to_mb)();
 void SRAM_HOT(serial_send_patch_lfo_block_to_mb)();
 void SRAM_HOT(serial_send_patch_mod_block_to_mb)();
+void SRAM_HOT(serial_send_patch_mix_block_to_mb)();
+
+void SRAM_HOT(serial_send_preset_burst_to_mb)(); 
 
 #endif
