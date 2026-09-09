@@ -288,10 +288,26 @@ static void __not_in_flash_func(dco_rx_handle_adsr1)(char cmd, const uint8_t* pa
   const AdsrBlock* blk = (const AdsrBlock*)payload;
   uint16_t dirty = 0;
 
-  if (blk->attack  != ADSR_VCA_attack)  { ADSR_VCA_attack  = blk->attack;  dirty |= ADSR_DIRTY_VCA_A; }
-  if (blk->decay   != ADSR_VCA_decay)   { ADSR_VCA_decay   = blk->decay;   dirty |= ADSR_DIRTY_VCA_D; }
-  if (blk->sustain != ADSR_VCA_sustain) { ADSR_VCA_sustain = blk->sustain; dirty |= ADSR_DIRTY_VCA_S; }
-  if (blk->release != ADSR_VCA_release) { ADSR_VCA_release = blk->release; dirty |= ADSR_DIRTY_VCA_R; }
+  if (blk->attack != ADSR_VCA_attack) {
+    ADSR_VCA_attack = blk->attack;
+    preset_shadow_capture(PARAM_ADSR1_ATTACK, (int16_t)blk->attack);
+    dirty |= ADSR_DIRTY_VCA_A;
+  }
+  if (blk->decay != ADSR_VCA_decay) {
+    ADSR_VCA_decay = blk->decay;
+    preset_shadow_capture(PARAM_ADSR1_DECAY, (int16_t)blk->decay);
+    dirty |= ADSR_DIRTY_VCA_D;
+  }
+  if (blk->sustain != ADSR_VCA_sustain) {
+    ADSR_VCA_sustain = blk->sustain;
+    preset_shadow_capture(PARAM_ADSR1_SUSTAIN, (int16_t)blk->sustain);
+    dirty |= ADSR_DIRTY_VCA_S;
+  }
+  if (blk->release != ADSR_VCA_release) {
+    ADSR_VCA_release = blk->release;
+    preset_shadow_capture(PARAM_ADSR1_RELEASE, (int16_t)blk->release);
+    dirty |= ADSR_DIRTY_VCA_R;
+  }
 
   if (dirty) mark_adsr_params_dirty(dirty);
   serial_forward_usb_edit_to_mb(cmd, payload, len);
@@ -301,10 +317,26 @@ static void __not_in_flash_func(dco_rx_handle_adsr2)(char cmd, const uint8_t* pa
   const AdsrBlock* blk = (const AdsrBlock*)payload;
   uint16_t dirty = 0;
 
-  if (blk->attack  != ADSR_VCF_attack)  { ADSR_VCF_attack  = blk->attack;  dirty |= ADSR_DIRTY_VCF_A; }
-  if (blk->decay   != ADSR_VCF_decay)   { ADSR_VCF_decay   = blk->decay;   dirty |= ADSR_DIRTY_VCF_D; }
-  if (blk->sustain != ADSR_VCF_sustain) { ADSR_VCF_sustain = blk->sustain; dirty |= ADSR_DIRTY_VCF_S; }
-  if (blk->release != ADSR_VCF_release) { ADSR_VCF_release = blk->release; dirty |= ADSR_DIRTY_VCF_R; }
+  if (blk->attack != ADSR_VCF_attack) {
+    ADSR_VCF_attack = blk->attack;
+    preset_shadow_capture(PARAM_ADSR2_ATTACK, (int16_t)blk->attack);
+    dirty |= ADSR_DIRTY_VCF_A;
+  }
+  if (blk->decay != ADSR_VCF_decay) {
+    ADSR_VCF_decay = blk->decay;
+    preset_shadow_capture(PARAM_ADSR2_DECAY, (int16_t)blk->decay);
+    dirty |= ADSR_DIRTY_VCF_D;
+  }
+  if (blk->sustain != ADSR_VCF_sustain) {
+    ADSR_VCF_sustain = blk->sustain;
+    preset_shadow_capture(PARAM_ADSR2_SUSTAIN, (int16_t)blk->sustain);
+    dirty |= ADSR_DIRTY_VCF_S;
+  }
+  if (blk->release != ADSR_VCF_release) {
+    ADSR_VCF_release = blk->release;
+    preset_shadow_capture(PARAM_ADSR2_RELEASE, (int16_t)blk->release);
+    dirty |= ADSR_DIRTY_VCF_R;
+  }
 
   if (dirty) mark_adsr_params_dirty(dirty);
   serial_forward_usb_edit_to_mb(cmd, payload, len);
@@ -314,10 +346,26 @@ static void __not_in_flash_func(dco_rx_handle_adsr3)(char cmd, const uint8_t* pa
   const AdsrBlock* blk = (const AdsrBlock*)payload;
   uint16_t dirty = 0;
 
-  if (blk->attack  != ADSR3_attack)  { ADSR3_attack  = blk->attack;  dirty |= ADSR_DIRTY_DCO_A; }
-  if (blk->decay   != ADSR3_decay)   { ADSR3_decay   = blk->decay;   dirty |= ADSR_DIRTY_DCO_D; }
-  if (blk->sustain != ADSR3_sustain) { ADSR3_sustain = blk->sustain; dirty |= ADSR_DIRTY_DCO_S; }
-  if (blk->release != ADSR3_release) { ADSR3_release = blk->release; dirty |= ADSR_DIRTY_DCO_R; }
+  if (blk->attack != ADSR3_attack) {
+    ADSR3_attack = blk->attack;
+    preset_shadow_capture(PARAM_ADSR3_ATTACK, (int16_t)blk->attack);
+    dirty |= ADSR_DIRTY_DCO_A;
+  }
+  if (blk->decay != ADSR3_decay) {
+    ADSR3_decay = blk->decay;
+    preset_shadow_capture(PARAM_ADSR3_DECAY, (int16_t)blk->decay);
+    dirty |= ADSR_DIRTY_DCO_D;
+  }
+  if (blk->sustain != ADSR3_sustain) {
+    ADSR3_sustain = blk->sustain;
+    preset_shadow_capture(PARAM_ADSR3_SUSTAIN, (int16_t)blk->sustain);
+    dirty |= ADSR_DIRTY_DCO_S;
+  }
+  if (blk->release != ADSR3_release) {
+    ADSR3_release = blk->release;
+    preset_shadow_capture(PARAM_ADSR3_RELEASE, (int16_t)blk->release);
+    dirty |= ADSR_DIRTY_DCO_R;
+  }
 
   if (dirty) mark_adsr_params_dirty(dirty);
   serial_forward_usb_edit_to_mb(cmd, payload, len);
@@ -326,13 +374,24 @@ static void __not_in_flash_func(dco_rx_handle_adsr3)(char cmd, const uint8_t* pa
 static void __not_in_flash_func(dco_rx_handle_filter_block)(char cmd, const uint8_t* payload, uint8_t len) {
   const FilterBlock* blk = (const FilterBlock*)payload;
 
-  CUTOFF     = blk->cutoff;
-  RESONANCE  = blk->resonance;
-  ADSR2toVCF = blk->env2_to_vcf;
-  LFO2toVCF  = blk->lfo2_to_vcf;
-
-  cv_bake_adsr2_to_vcf_scale();
-  cv_bake_lfo2_to_vcf_scale();
+  if (blk->cutoff != CUTOFF) {
+    CUTOFF = blk->cutoff;
+    preset_shadow_capture(PARAM_VCF_CUTOFF, (int16_t)CUTOFF);
+  }
+  if (blk->resonance != RESONANCE) {
+    RESONANCE = blk->resonance;
+    preset_shadow_capture(PARAM_VCF_RESONANCE, (int16_t)RESONANCE);
+  }
+  if (blk->env2_to_vcf != ADSR2toVCF) {
+    ADSR2toVCF = blk->env2_to_vcf;
+    preset_shadow_capture(PARAM_ADSR2_TO_VCF, ADSR2toVCF);
+    cv_bake_adsr2_to_vcf_scale();
+  }
+  if (blk->lfo2_to_vcf != LFO2toVCF) {
+    LFO2toVCF = blk->lfo2_to_vcf;
+    preset_shadow_capture(PARAM_LFO2_TO_VCF, (int16_t)LFO2toVCF);
+    cv_bake_lfo2_to_vcf_scale();
+  }
 
   serial_forward_usb_edit_to_mb(cmd, payload, len);
 }

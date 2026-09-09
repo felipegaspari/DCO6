@@ -376,8 +376,49 @@ static void SRAM_HOT(apply_param_adsr1_mode)(int16_t v) {
    set_vcf_trigger_mode((uint8_t)v);
  }
  
+// =============================================================================
+// 5. FILTER & ENVELOPE DISCRETE APPLIERS
+// =============================================================================
+
+// --- Filter Block Appliers ---
+static void SRAM_HOT(apply_param_vcf_cutoff)(int16_t v) {
+  CUTOFF = (uint16_t)v;
+}
+
+static void SRAM_HOT(apply_param_vcf_resonance)(int16_t v) {
+  RESONANCE = (uint16_t)v;
+}
+
+static void SRAM_HOT(apply_param_adsr2_to_vcf)(int16_t v) {
+  ADSR2toVCF = v;
+  cv_bake_adsr2_to_vcf_scale();
+}
+
+static void SRAM_HOT(apply_param_lfo2_to_vcf)(int16_t v) {
+  LFO2toVCF = (uint16_t)v;
+  cv_bake_lfo2_to_vcf_scale();
+}
+
+// --- EnvVCA (ADSR1) Appliers ---
+static void SRAM_HOT(apply_param_adsr1_attack)(int16_t v)  { ADSR_VCA_attack = (uint16_t)v;  mark_adsr_params_dirty(ADSR_DIRTY_VCA_A); }
+static void SRAM_HOT(apply_param_adsr1_decay)(int16_t v)   { ADSR_VCA_decay = (uint16_t)v;   mark_adsr_params_dirty(ADSR_DIRTY_VCA_D); }
+static void SRAM_HOT(apply_param_adsr1_sustain)(int16_t v) { ADSR_VCA_sustain = (uint16_t)v; mark_adsr_params_dirty(ADSR_DIRTY_VCA_S); }
+static void SRAM_HOT(apply_param_adsr1_release)(int16_t v) { ADSR_VCA_release = (uint16_t)v; mark_adsr_params_dirty(ADSR_DIRTY_VCA_R); }
+
+// --- EnvVCF (ADSR2) Appliers ---
+static void SRAM_HOT(apply_param_adsr2_attack)(int16_t v)  { ADSR_VCF_attack = (uint16_t)v;  mark_adsr_params_dirty(ADSR_DIRTY_VCF_A); }
+static void SRAM_HOT(apply_param_adsr2_decay)(int16_t v)   { ADSR_VCF_decay = (uint16_t)v;   mark_adsr_params_dirty(ADSR_DIRTY_VCF_D); }
+static void SRAM_HOT(apply_param_adsr2_sustain)(int16_t v) { ADSR_VCF_sustain = (uint16_t)v; mark_adsr_params_dirty(ADSR_DIRTY_VCF_S); }
+static void SRAM_HOT(apply_param_adsr2_release)(int16_t v) { ADSR_VCF_release = (uint16_t)v; mark_adsr_params_dirty(ADSR_DIRTY_VCF_R); }
+
+// --- EnvDCO (ADSR3) Appliers ---
+static void SRAM_HOT(apply_param_adsr3_attack)(int16_t v)  { ADSR3_attack = (uint16_t)v;  mark_adsr_params_dirty(ADSR_DIRTY_DCO_A); }
+static void SRAM_HOT(apply_param_adsr3_decay)(int16_t v)   { ADSR3_decay = (uint16_t)v;   mark_adsr_params_dirty(ADSR_DIRTY_DCO_D); }
+static void SRAM_HOT(apply_param_adsr3_sustain)(int16_t v) { ADSR3_sustain = (uint16_t)v; mark_adsr_params_dirty(ADSR_DIRTY_DCO_S); }
+static void SRAM_HOT(apply_param_adsr3_release)(int16_t v) { ADSR3_release = (uint16_t)v; mark_adsr_params_dirty(ADSR_DIRTY_DCO_R); }
+
  // =============================================================================
- // 5. CALIBRATION CONTROLS & STORAGE TRIMS
+ // 6. CALIBRATION CONTROLS & STORAGE TRIMS
  // =============================================================================
  
  static void dco_send_all_calibration_data() {
@@ -759,6 +800,28 @@ static void SRAM_HOT(apply_param_adsr1_mode)(int16_t v) {
      {PARAM_ADSR2_MODE, apply_param_adsr2_mode},
      {PARAM_ADSR1_MODE, apply_param_adsr1_mode},
 
+     // --- VCF & Filter Block ---
+    {PARAM_VCF_CUTOFF,    apply_param_vcf_cutoff},
+    {PARAM_VCF_RESONANCE, apply_param_vcf_resonance},
+    {PARAM_ADSR2_TO_VCF,  apply_param_adsr2_to_vcf},
+    {PARAM_LFO2_TO_VCF,   apply_param_lfo2_to_vcf},
+
+    // --- Envelope Times (ADSR 1, 2, 3) ---
+    {PARAM_ADSR1_ATTACK,  apply_param_adsr1_attack},
+    {PARAM_ADSR1_DECAY,   apply_param_adsr1_decay},
+    {PARAM_ADSR1_SUSTAIN, apply_param_adsr1_sustain},
+    {PARAM_ADSR1_RELEASE, apply_param_adsr1_release},
+
+    {PARAM_ADSR2_ATTACK,  apply_param_adsr2_attack},
+    {PARAM_ADSR2_DECAY,   apply_param_adsr2_decay},
+    {PARAM_ADSR2_SUSTAIN, apply_param_adsr2_sustain},
+    {PARAM_ADSR2_RELEASE, apply_param_adsr2_release},
+
+    {PARAM_ADSR3_ATTACK,  apply_param_adsr3_attack},
+    {PARAM_ADSR3_DECAY,   apply_param_adsr3_decay},
+    {PARAM_ADSR3_SUSTAIN, apply_param_adsr3_sustain},
+    {PARAM_ADSR3_RELEASE, apply_param_adsr3_release},
+
      // --- Modulation Matrix (Slots 0..7) ---
     {PARAM_MOD_SLOT0_SOURCE, apply_param_mod_slot0_source},
     {PARAM_MOD_SLOT0_DEST,   apply_param_mod_slot0_dest},
@@ -1010,5 +1073,32 @@ static void SRAM_HOT(apply_param_adsr1_mode)(int16_t v) {
  
    // 4. Apply Shared Filter Trigger Mode (Legato / Multi / Direct)
    set_vcf_trigger_mode((uint8_t)presetParamShadow[PARAM_VCF_TRIGGER_MODE]);
+
+   // =========================================================================
+    // Filter & Envelope Times (Loaded from presetParamShadow)
+    // =========================================================================
+    CUTOFF     = (uint16_t)presetParamShadow[PARAM_VCF_CUTOFF];
+    RESONANCE  = (uint16_t)presetParamShadow[PARAM_VCF_RESONANCE];
+    ADSR2toVCF = presetParamShadow[PARAM_ADSR2_TO_VCF];
+    LFO2toVCF  = (uint16_t)presetParamShadow[PARAM_LFO2_TO_VCF];
+    cv_bake_adsr2_to_vcf_scale();
+    cv_bake_lfo2_to_vcf_scale();
+
+    ADSR_VCA_attack  = (uint16_t)presetParamShadow[PARAM_ADSR1_ATTACK];
+    ADSR_VCA_decay   = (uint16_t)presetParamShadow[PARAM_ADSR1_DECAY];
+    ADSR_VCA_sustain = (uint16_t)presetParamShadow[PARAM_ADSR1_SUSTAIN];
+    ADSR_VCA_release = (uint16_t)presetParamShadow[PARAM_ADSR1_RELEASE];
+
+    ADSR_VCF_attack  = (uint16_t)presetParamShadow[PARAM_ADSR2_ATTACK];
+    ADSR_VCF_decay   = (uint16_t)presetParamShadow[PARAM_ADSR2_DECAY];
+    ADSR_VCF_sustain = (uint16_t)presetParamShadow[PARAM_ADSR2_SUSTAIN];
+    ADSR_VCF_release = (uint16_t)presetParamShadow[PARAM_ADSR2_RELEASE];
+
+    ADSR3_attack     = (uint16_t)presetParamShadow[PARAM_ADSR3_ATTACK];
+    ADSR3_decay      = (uint16_t)presetParamShadow[PARAM_ADSR3_DECAY];
+    ADSR3_sustain    = (uint16_t)presetParamShadow[PARAM_ADSR3_SUSTAIN];
+    ADSR3_release    = (uint16_t)presetParamShadow[PARAM_ADSR3_RELEASE];
+
+    mark_adsr_params_dirty(ADSR_DIRTY_VCA_ALL | ADSR_DIRTY_VCF_ALL | ADSR_DIRTY_DCO_ALL);
  
   }

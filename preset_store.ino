@@ -182,69 +182,45 @@ static void preset_record_build(uint8_t* buf) {
     buf[PRESET_OFF_NAME + i] = presetName[i];
   }
 
+  // 100% of the preset lives in the shadow array and bitmap
   memcpy(buf + PRESET_OFF_BITMAP, presetParamSetBitmap, sizeof(presetParamSetBitmap));
   for (uint16_t id = 0; id < PRESET_PARAM_COUNT; ++id) {
     encode_u16_le(buf + PRESET_OFF_PARAMS + id * 2, (uint16_t)presetParamShadow[id]);
   }
 
-  const uint16_t blocks[PRESET_BLOCK_FIELDS] = {
-    ADSR_VCA_attack, ADSR_VCA_decay, ADSR_VCA_sustain, ADSR_VCA_release,
-    ADSR_VCF_attack, ADSR_VCF_decay, ADSR_VCF_sustain, ADSR_VCF_release,
-    ADSR3_attack,    ADSR3_decay,    ADSR3_sustain,    ADSR3_release,
-    CUTOFF,          RESONANCE,      (uint16_t)ADSR2toVCF, LFO2toVCF,
-  };
-  for (uint8_t i = 0; i < PRESET_BLOCK_FIELDS; ++i) {
-    encode_u16_le(buf + PRESET_OFF_BLOCKS + i * 2, blocks[i]);
-  }
-
+  // CRC32 over the entire record payload up to OFF_CRC
   encode_u32_le(buf + PRESET_OFF_CRC, preset_crc32(buf, PRESET_OFF_CRC));
+}
+
+static void __not_in_flash_func(preset_record_apply)(const uint8_t* buf) {
+  // 1. Direct restore from flash into RAM shadow
+  memcpy(presetParamShadow, buf + PRESET_OFF_PARAMS, sizeof(presetParamShadow));
+  memcpy(presetParamSetBitmap, buf + PRESET_OFF_BITMAP, sizeof(presetParamSetBitmap));
+
+  // 2. Transmit burst updates to Mainboard using the freshly unpacked shadow values
+  serial_send_adsr_vca_block_to_mb();
+  serial_send_adsr_vcf_block_to_mb();
+  serial_send_adsr_dco_block_to_mb();
+  serial_send_filter_block_to_mb();
+  serial_dma_poll_one(0);
+  serial_send_patch_osc_block_to_mb();
+  serial_send_patch_lfo_block_to_mb();
+  serial_dma_poll_one(0);
+  serial_send_patch_mod_block_to_mb();
+  serial_send_patch_mix_block_to_mb();
+
+
+  // 3. Apply local DCO engine state and bake filter/envelope scales
+  dco_apply_preset_shadow();
+  mark_adsr_params_dirty(ADSR_DIRTY_VCA_ALL | ADSR_DIRTY_VCF_ALL | ADSR_DIRTY_DCO_ALL);
+  cv_bake_adsr2_to_vcf_scale();
+  cv_bake_lfo2_to_vcf_scale();
 }
 
 static bool preset_record_validate(const uint8_t* buf) {
   if (buf[PRESET_OFF_MAGIC] != PRESET_MAGIC) return false;
   if (buf[PRESET_OFF_VERSION] != PRESET_VERSION) return false;
   return decode_u32_le(buf + PRESET_OFF_CRC) == preset_crc32(buf, PRESET_OFF_CRC);
-}
-
-static void __not_in_flash_func(preset_record_apply)(const uint8_t* buf) {
-  memcpy(presetParamShadow, buf + PRESET_OFF_PARAMS, sizeof(presetParamShadow));
-  memcpy(presetParamSetBitmap, buf + PRESET_OFF_BITMAP, sizeof(presetParamSetBitmap));
-
-  const uint8_t* b = buf + PRESET_OFF_BLOCKS;
-  ADSR_VCA_attack  = decode_u16_le(b + 0);
-  ADSR_VCA_decay   = decode_u16_le(b + 2);
-  ADSR_VCA_sustain = decode_u16_le(b + 4);
-  ADSR_VCA_release = decode_u16_le(b + 6);
-
-  ADSR_VCF_attack  = decode_u16_le(b + 8);
-  ADSR_VCF_decay   = decode_u16_le(b + 10);
-  ADSR_VCF_sustain = decode_u16_le(b + 12);
-  ADSR_VCF_release = decode_u16_le(b + 14);
-
-  ADSR3_attack     = decode_u16_le(b + 16);
-  ADSR3_decay      = decode_u16_le(b + 18);
-  ADSR3_sustain    = decode_u16_le(b + 20);
-  ADSR3_release    = decode_u16_le(b + 22);
-
-  CUTOFF           = decode_u16_le(b + 24);
-  RESONANCE        = decode_u16_le(b + 26);
-  ADSR2toVCF       = (int16_t)decode_u16_le(b + 28);
-  LFO2toVCF        = decode_u16_le(b + 30);
-
-  serial_send_adsr_vca_block_to_mb();
-  serial_send_adsr_vcf_block_to_mb();
-  serial_send_adsr_dco_block_to_mb();
-  serial_send_filter_block_to_mb();
-
-  serial_send_patch_osc_block_to_mb();
-  serial_send_patch_lfo_block_to_mb();
-  serial_send_patch_mod_block_to_mb();
-  serial_send_patch_mix_block_to_mb();
-
-  dco_apply_preset_shadow();
-  mark_adsr_params_dirty(ADSR_DIRTY_VCA_ALL | ADSR_DIRTY_VCF_ALL | ADSR_DIRTY_DCO_ALL);
-  cv_bake_adsr2_to_vcf_scale();
-  cv_bake_lfo2_to_vcf_scale();
 }
 
 static void preset_store_write_last(uint8_t slot) {
