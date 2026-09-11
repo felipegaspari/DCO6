@@ -134,8 +134,8 @@ void __not_in_flash_func(serial_send_patch_osc_block_to_mb)() {
   blk.portamento_time     = (uint16_t)presetParamShadow[PARAM_PORTAMENTO_TIME];
   blk.portamento_mode     = (uint8_t)presetParamShadow[PARAM_PORTAMENTO_MODE];
   blk.character           = (uint8_t)presetParamShadow[PARAM_CHARACTER];
-  blk.crossmod_depth      = (uint16_t)presetParamShadow[PARAM_CROSSMOD_DEPTH];
-  blk.crossmod_mode       = (uint8_t)presetParamShadow[PARAM_CROSSMOD_MODE];
+  blk.crossmod_depth      = (uint16_t)presetParamShadow[PARAM_XMOD_DEPTH];
+  blk.crossmod_mode       = (uint8_t)presetParamShadow[PARAM_XMOD_MODE];
 
   serial_frame_write(Serial2Dma, CMD_BLOCK_OSC, (const uint8_t*)&blk, SERIAL_LEN_BLOCK_OSC);
 }

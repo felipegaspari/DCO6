@@ -9,23 +9,61 @@ static constexpr float MAX_EXPO_OCTAVES  = 2.5f;
 static constexpr float LIN_DEPTH_SCALER  = MAX_LIN_DEPTH / 32768.0f;
 static constexpr float EXPO_DEPTH_SCALER = MAX_EXPO_OCTAVES / 32768.0f;
 
-// 128-bit aligned cache structure to enable dual-word (LDRD) burst loads in SRAM
-struct alignas(16) XmodPrebaked {
-    int32_t base_xmod;       // 4 bytes (offset 0)
-    float   expo_depth;      // 4 bytes (offset 4)  - Scaled octaves
-    float   expo_bias;       // 4 bytes (offset 8)  - Pre-calculated 2.5-octave bias
-    float   lin_norm;        // 4 bytes (offset 12) - Pre-calculated atanh period compensation
-    float   lin_depth_norm;  // 4 bytes (offset 16) - Fused constant (lin_depth * lin_norm) for 1-cycle VFMA
-    bool    active;          // 1 byte  (offset 20)
-    uint8_t _pad[3];         // 3 bytes explicit padding to maintain 32-bit alignment
+// 0 to 32767 (Q15 format)
+uint16_t crossmod_depth = 0;
+volatile uint8_t crossmod_mode = 1;
+volatile uint8_t crossmod_shape = 0;      // Default: Triangle
+volatile uint8_t crossmod_ratio = 2;      // Default: Index 2 (1.0x Ratio)
+volatile uint8_t crossmod_detune = 128;   // Default: Center
+volatile uint8_t crossmod_symmetry = 128; // Default: 50%
+
+#ifndef NUM_VOICES_TOTAL
+#define NUM_VOICES_TOTAL 16
+#endif
+
+extern uint32_t shadow_phase_osc2_q32[NUM_VOICES_TOTAL];
+
+// 32-byte aligned cache structure (Perfect Cortex-M Cache Line Size)
+struct alignas(32) XmodPrebaked {
+    int32_t  base_xmod;       // 4 bytes (offset 0)
+    float    expo_depth;      // 4 bytes (offset 4)
+    float    expo_bias;       // 4 bytes (offset 8)
+    float    lin_norm;        // 4 bytes (offset 12)
+    float    lin_depth_norm;  // 4 bytes (offset 16)
+    float    mod_freq_scalar; // 4 bytes (offset 20) - Ratio * Detune multiplier
+    uint32_t symmetry_q32;    // 4 bytes (offset 24) - For Square PWM
+    uint8_t  shape;           // 1 byte  (offset 28) - Selected waveshape
+    bool     active;          // 1 byte  (offset 29)
+    uint8_t  _pad[2];         // 2 bytes explicit padding to 32 bytes
 };
 
 // Global instance matching your existing placement
 inline XmodPrebaked xmod_cache;
 
-// FIX 1: Matched volatile qualifier with globals.h
-extern volatile uint8_t crossmod_mode;
-extern uint32_t shadow_phase_osc2_q32[NUM_VOICES_TOTAL];
+// Explicit pre-computed constant to replace inline divisions in the hot loop
+static constexpr float Q31_TO_FLOAT      = 4.656612873077392578125e-10f;
+static constexpr float FOUR_Q31_TO_FLOAT = 4.0f * Q31_TO_FLOAT;
+
+struct XmodCurveFit {
+    float expo_c1;  // Primary Taylor coefficient
+    float expo_c2;  // Higher-order correction coefficient
+    float lin_var;  // RMS variance scalar for Linear FM
+};
+
+// Precisely tuned Minimax polynomial coefficients for perfect Expo FM pitch tracking
+static constexpr XmodCurveFit XMOD_CURVES[4] = {
+    {0.115525f, 0.001655f, 1.0f}, // 0: Triangle
+    {0.115525f, 0.001655f, 1.0f}, // 1: Sawtooth
+    {0.334000f, 0.014000f, 3.0f}, // 2: Square
+    {0.208000f, 0.008500f, 1.6f}  // 3: Parabolic Sine
+};
+
+static constexpr float XMOD_RATIO_TABLE[7] = {
+    0.25f, 0.5f, 0.75f, 1.0f, 2.0f, 3.0f, 4.0f
+};
+
+// Aligned to 16 bytes for Cortex-M33 128-bit bus transfers
+alignas(16) static uint32_t shadow_phase_xmod_q32[NUM_VOICES_TOTAL] = {0};
 
 /**
  * @brief Restored exact function name: call this when your depth parameter changes.
@@ -33,6 +71,16 @@ extern uint32_t shadow_phase_osc2_q32[NUM_VOICES_TOTAL];
  */
 static inline void update_crossmod_prebake(int32_t depth_q15) {
     xmod_cache.base_xmod = depth_q15;
+    xmod_cache.shape     = crossmod_shape;
+
+    // Pre-bake Ratio & Detune multipliers
+    float ratio  = XMOD_RATIO_TABLE[crossmod_ratio & 0x07];
+    float detune = __builtin_fmaf((float)crossmod_detune - 128.0f, 0.000226f, 1.0f); 
+    xmod_cache.mod_freq_scalar = ratio * detune;
+
+    // Pre-bake Square Symmetry (128 = exact 50% duty / 0 DC offset)
+    int32_t sym_offset = (int32_t)crossmod_symmetry - 128; 
+    xmod_cache.symmetry_q32 = 0x80000000u + (uint32_t)(sym_offset * 15099494);
 
     if (depth_q15 <= 0) {
         xmod_cache.active         = false;
@@ -47,20 +95,25 @@ static inline void update_crossmod_prebake(int32_t depth_q15) {
     uint32_t clamped = (uint32_t)__builtin_arm_usat(depth_q15, 15);
     xmod_cache.active = true;
 
-    // Pre-bake Mode 0 (Centered Expo FM)
-    float mod_depth = (float)clamped * EXPO_DEPTH_SCALER;
-    float depth_sq  = mod_depth * mod_depth;
-    xmod_cache.expo_depth = mod_depth;
-    xmod_cache.expo_bias  = (0.115525f - (0.001655f * depth_sq)) * depth_sq;
+    // Fetch precise Taylor fit coefficients for the selected waveshape
+    const XmodCurveFit& curve = XMOD_CURVES[crossmod_shape & 0x03];
 
-    // Pre-bake Mode 2 (Linear FM)
+    // Pre-bake Mode 0 (Centered Expo FM) using hardware FMA
+    float mod_depth = (float)clamped * EXPO_DEPTH_SCALER;
+    float d2        = mod_depth * mod_depth;
+    xmod_cache.expo_depth = mod_depth;
+    xmod_cache.expo_bias  = __builtin_fmaf(-curve.expo_c2, d2, curve.expo_c1) * d2;
+
+    // Pre-bake Mode 2 (Linear FM) using Horner FMA evaluation
     float lin_depth = (float)clamped * LIN_DEPTH_SCALER;
-    float d2        = lin_depth * lin_depth;
+    float l2        = lin_depth * lin_depth * curve.lin_var;
     // Horner form evaluation for period averaging compensation
-    float lin_norm  = 1.0f + d2 * (0.333333f + d2 * (0.12f + d2 * 0.48f));
+    float p         = __builtin_fmaf(0.48f, l2, 0.12f);
+    p               = __builtin_fmaf(p, l2, 0.33333334f);
+    float lin_norm  = __builtin_fmaf(p, l2, 1.0f);
 
     xmod_cache.lin_norm       = lin_norm;
-    xmod_cache.lin_depth_norm = lin_depth * lin_norm;
+    xmod_cache.lin_depth_norm = lin_depth * lin_norm; 
 }
 
 // =============================================================================
@@ -86,7 +139,7 @@ static inline __attribute__((always_inline)) float fast_exp2f_audio(float p) {
 
     // 4. Horner form quadratic approximation: (0.304153 * f + 0.695847) * f + 1.0
     // Compiles into 2 single-cycle VFMA.F32 instructions
-    float approx = (0.304153f * f + 0.695847f) * f + 1.0f;
+    float approx = __builtin_fmaf(__builtin_fmaf(0.304153f, f, 0.695847f), f, 1.0f);
 
     // 5. Exponent reconstruction via IEEE-754
     uint32_t exp_bits = (uint32_t)(i + 127) << 23;
@@ -102,12 +155,10 @@ static inline __attribute__((always_inline)) float fast_exp2f_audio(float p) {
     return approx * exp_scale;
 }
 
-static uint32_t shadow_phase_xmod_q32[NUM_VOICES_TOTAL] = {0};
-
 // =============================================================================
-// TEMPLATE-SPECIALIZED CROSSMOD ENGINE CORE (Zero-Cost Branching)
+// DUAL-SPECIALIZED TEMPLATE ENGINE (Zero Runtime Branches for Mode & Shape)
 // =============================================================================
-template <uint8_t Mode>
+template <uint8_t Mode, uint8_t Shape>
 static inline __attribute__((always_inline)) float SRAM_HOT(apply_crossmod_impl)(
     uint8_t voice_idx,
     float carrier_freq_Hz,
@@ -116,11 +167,13 @@ static inline __attribute__((always_inline)) float SRAM_HOT(apply_crossmod_impl)
     int32_t mod_matrix_delta
 ) {
     // -------------------------------------------------------------------------
-    // CRITICAL AUDIO FIX: ALWAYS advance modulator shadow phase first!
+    // CRITICAL PHASE UPDATE (Now accounts for Ratio and Detune!)
+    // ALWAYS advance modulator shadow phase first!
     // Prevents phase-freeze glitches & attack clicks when modulation depth is 0.
     // -------------------------------------------------------------------------
+    float actual_mod_hz = modulator_freq_Hz * xmod_cache.mod_freq_scalar;
     uint32_t phase = shadow_phase_xmod_q32[voice_idx];
-    phase += (uint32_t)(modulator_freq_Hz * hz_to_phase_inc);
+    phase += (uint32_t)(actual_mod_hz * hz_to_phase_inc);
     shadow_phase_xmod_q32[voice_idx] = phase;
 
     // Fast 1-cycle hardware saturation [0, 32767]
@@ -131,59 +184,80 @@ static inline __attribute__((always_inline)) float SRAM_HOT(apply_crossmod_impl)
     }
 
     // -------------------------------------------------------------------------
-    // 1-CYCLE HARDWARE FIXED-POINT CONVERSION & TRIANGLE FOLD
+    // 1-CYCLE HARDWARE WAVESHAPE GENERATION (No runtime divisions or switches)
     // -------------------------------------------------------------------------
-    int32_t tri_q31 = (int32_t)((phase << 1) ^ ((int32_t)phase >> 31) ^ 0x80000000u);
+    float shadow_mod;
+    if constexpr (Shape == 1) { // Case 1: Sawtooth
+        shadow_mod = (float)((int32_t)phase) * Q31_TO_FLOAT;
+    }
+    else if constexpr (Shape == 2) { // Case 2: Square (Zero math required, PWM bounded by Symmetry)
+        shadow_mod = (phase < xmod_cache.symmetry_q32) ? 1.0f : -1.0f;
+    }
+    else if constexpr (Shape == 3) { // Case 3: Parabolic Sine (Glassy pure FM)
+        // FMA transformation: 4x(1 - |x|) = 4x - 4x|x| = 4x + (4x * -|x|)
+        float x  = (float)((int32_t)phase) * Q31_TO_FLOAT;
+        float x4 = (float)((int32_t)phase) * FOUR_Q31_TO_FLOAT;
+        shadow_mod = __builtin_fmaf(x4, -__builtin_fabsf(x), x4);
+    }
+    else { // Case 0: Triangle
+        int32_t tri_q31 = (int32_t)((phase << 1) ^ ((int32_t)phase >> 31) ^ 0x80000000u);
+        shadow_mod = (float)tri_q31 * Q31_TO_FLOAT;
+    }
 
-    float shadow_tri;
-#if defined(__ARM_ARCH) && !defined(__riscv)
-    __asm__ ("vmov         %0, %1\n\t"
-             "vcvt.f32.s32 %0, %0, #31"
-             : "=t"(shadow_tri) : "r"(tri_q31));
-#else
-    shadow_tri = (float)tri_q31 * (1.0f / 2147483648.0f);
-#endif
-
+    // -------------------------------------------------------------------------
+    // FREQUENCY MODULATION CALCULATION
+    // -------------------------------------------------------------------------
     float out_freq_Hz;
 
     // Static / Prebaked path (Common Case: mod_matrix_delta == 0)
     if (__builtin_expect(mod_matrix_delta == 0, 1)) {
         if constexpr (Mode == 0) { // Centered Exponential FM
-            float octaves = shadow_tri * xmod_cache.expo_depth - xmod_cache.expo_bias;
+            // 1-cycle VFMS / VFMA
+            float octaves = __builtin_fmaf(shadow_mod, xmod_cache.expo_depth, -xmod_cache.expo_bias);
             out_freq_Hz = carrier_freq_Hz * fast_exp2f_audio(octaves);
-            return out_freq_Hz; // Strictly positive: zero clamp stall needed
         } 
         else if constexpr (Mode == 1) { // Vintage Uncentered Exponential FM
-            float octaves = shadow_tri * xmod_cache.expo_depth;
+            float octaves = shadow_mod * xmod_cache.expo_depth;
             out_freq_Hz = carrier_freq_Hz * fast_exp2f_audio(octaves);
-            return out_freq_Hz; // Strictly positive: zero clamp stall needed
         } 
         else { // Mode 2: True Linear FM
-            float mod_mult = xmod_cache.lin_norm + shadow_tri * xmod_cache.lin_depth_norm;
-            out_freq_Hz = carrier_freq_Hz * mod_mult;
-            return (out_freq_Hz < 10.0f) ? 10.0f : out_freq_Hz;
+            // 1-cycle VFMA + 1-cycle VMUL
+            float factor = __builtin_fmaf(shadow_mod, xmod_cache.lin_depth_norm, xmod_cache.lin_norm);
+            out_freq_Hz = carrier_freq_Hz * factor;
         }
     } 
     // Dynamic mod-matrix path (When LFO/Env modulates crossmod depth)
     else {
-        if constexpr (Mode == 2) {
+        // Fetch precise Taylor fit coefficients for real-time drift compensation
+        // Resolved at compile time as immediate constants (Zero SRAM bus read)
+        constexpr float curve_lin_var = XMOD_CURVES[Shape].lin_var;
+        constexpr float curve_expo_c1 = XMOD_CURVES[Shape].expo_c1;
+        constexpr float curve_expo_c2 = XMOD_CURVES[Shape].expo_c2;
+
+        if constexpr (Mode == 2) { // True Linear FM
             float d = (float)total_mod_q15 * LIN_DEPTH_SCALER;
-            float d2 = d * d;
-            float norm = 1.0f + d2 * (0.333333f + d2 * (0.12f + d2 * 0.48f));
-            out_freq_Hz = carrier_freq_Hz * (norm + shadow_tri * (d * norm));
-            return (out_freq_Hz < 10.0f) ? 10.0f : out_freq_Hz;
+            float l2 = (d * d) * curve_lin_var;
+            // Fully inlined Horner evaluation via VFMA.F32
+            float p = __builtin_fmaf(0.48f, l2, 0.12f);
+            p       = __builtin_fmaf(p, l2, 0.33333334f);
+            float norm = __builtin_fmaf(p, l2, 1.0f);
+            float d_norm = d * norm;
+            out_freq_Hz = carrier_freq_Hz * __builtin_fmaf(shadow_mod, d_norm, norm);
         } 
-        else if constexpr (Mode == 0) {
+        else if constexpr (Mode == 0) { // Centered Exponential FM
             float d = (float)total_mod_q15 * EXPO_DEPTH_SCALER;
             float d2 = d * d;
-            float bias = (0.115525f - (0.001655f * d2)) * d2;
-            return carrier_freq_Hz * fast_exp2f_audio((shadow_tri * d) - bias);
+            float bias = __builtin_fmaf(-curve_expo_c2, d2, curve_expo_c1) * d2;
+            float octaves = __builtin_fmaf(shadow_mod, d, -bias);
+            out_freq_Hz = carrier_freq_Hz * fast_exp2f_audio(octaves);
         } 
-        else { // Mode 1
+        else { // Mode 1: Vintage Uncentered Exponential FM
             float d = (float)total_mod_q15 * EXPO_DEPTH_SCALER;
-            return carrier_freq_Hz * fast_exp2f_audio(shadow_tri * d);
+            out_freq_Hz = carrier_freq_Hz * fast_exp2f_audio(shadow_mod * d);
         }
     }
+
+    return out_freq_Hz;
 }
 
 // =============================================================================
@@ -201,7 +275,13 @@ static inline __attribute__((always_inline)) float SRAM_HOT(apply_crossmod)(
     float hz_to_phase_inc,
     int32_t mod_matrix_delta
 ) {
-    return apply_crossmod_impl<Mode>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+    switch (xmod_cache.shape & 0x03) {
+        case 0:  return apply_crossmod_impl<Mode, 0>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+        case 1:  return apply_crossmod_impl<Mode, 1>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+        case 2:  return apply_crossmod_impl<Mode, 2>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+        case 3:
+        default: return apply_crossmod_impl<Mode, 3>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+    }
 }
 
 /**
@@ -214,10 +294,32 @@ static inline __attribute__((always_inline)) float SRAM_HOT(apply_crossmod)(
     float hz_to_phase_inc,
     int32_t mod_matrix_delta
 ) {
+    const uint8_t shape = xmod_cache.shape & 0x03;
     switch (crossmod_mode) {
-        case 0:  return apply_crossmod_impl<0>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
-        case 1:  return apply_crossmod_impl<1>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
-        case 2:
-        default: return apply_crossmod_impl<2>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+        case 0: // Centered Exponential FM
+            switch (shape) {
+                case 0:  return apply_crossmod_impl<0, 0>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+                case 1:  return apply_crossmod_impl<0, 1>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+                case 2:  return apply_crossmod_impl<0, 2>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+                case 3:
+                default: return apply_crossmod_impl<0, 3>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+            }
+        case 1: // Vintage Uncentered Exponential FM
+            switch (shape) {
+                case 0:  return apply_crossmod_impl<1, 0>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+                case 1:  return apply_crossmod_impl<1, 1>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+                case 2:  return apply_crossmod_impl<1, 2>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+                case 3:
+                default: return apply_crossmod_impl<1, 3>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+            }
+        case 2: // True Linear FM
+        default:
+            switch (shape) {
+                case 0:  return apply_crossmod_impl<2, 0>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+                case 1:  return apply_crossmod_impl<2, 1>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+                case 2:  return apply_crossmod_impl<2, 2>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+                case 3:
+                default: return apply_crossmod_impl<2, 3>(voice_idx, carrier_freq_Hz, modulator_freq_Hz, hz_to_phase_inc, mod_matrix_delta);
+            }
     }
 }

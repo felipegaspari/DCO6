@@ -109,11 +109,6 @@ volatile uint8_t voiceMode = 1;
 volatile uint8_t syncMode = 0;
 volatile uint8_t oscPhaseSync = 0;
 
-
-// 0 to 32767 (Q15 format)
-uint16_t crossmod_depth = 0;
-volatile uint8_t crossmod_mode = 1;
-
 bool pulseWaveOn = false;
 
 // Voice allocation policy (PARAM_VOICE_ALLOC_MODE) lives on the voiceAlloc

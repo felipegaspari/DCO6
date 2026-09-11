@@ -168,13 +168,30 @@ static void SRAM_HOT(apply_param_soft_sync)(int16_t v) {
    setSyncMode();
 }
 
-static void SRAM_HOT(apply_param_crossmod_depth)(int16_t v) {
+static void SRAM_HOT(apply_param_xmod_depth)(int16_t v) {
   crossmod_depth = (uint16_t)v;
   update_crossmod_prebake(crossmod_depth);
 }
 
-static void SRAM_HOT(apply_param_crossmod_mode)(int16_t v)   { 
+static void SRAM_HOT(apply_param_xmod_mode)(int16_t v)   { 
   crossmod_mode = (uint8_t)v; 
+}
+
+static void SRAM_HOT(apply_param_xmod_shape)(int16_t v) { 
+  crossmod_shape = (uint8_t)v; 
+  update_crossmod_prebake(crossmod_depth); 
+}
+static void SRAM_HOT(apply_param_xmod_ratio)(int16_t v) { 
+  crossmod_ratio = (uint8_t)v; 
+  update_crossmod_prebake(crossmod_depth); 
+}
+static void SRAM_HOT(apply_param_xmod_detune)(int16_t v) { 
+  crossmod_detune = (uint8_t)v; 
+  update_crossmod_prebake(crossmod_depth); 
+}
+static void SRAM_HOT(apply_param_xmod_symmetry)(int16_t v) { 
+  crossmod_symmetry = (uint8_t)v; 
+  update_crossmod_prebake(crossmod_depth); 
 }
 
  static void SRAM_HOT(apply_param_subosc_divide)(int16_t v) { subOscDivide = (uint8_t)v; }
@@ -774,8 +791,12 @@ static void SRAM_HOT(apply_param_adsr3_release)(int16_t v) { ADSR3_release = (ui
      {PARAM_SOFT_SYNC, apply_param_soft_sync},
      {PARAM_SUBOSC_DIVIDE, apply_param_subosc_divide},
      // --- Digital Modulation ---
-     {PARAM_CROSSMOD_DEPTH, apply_param_crossmod_depth},
-     {PARAM_CROSSMOD_MODE, apply_param_crossmod_mode},
+     {PARAM_XMOD_DEPTH, apply_param_xmod_depth},
+     {PARAM_XMOD_MODE, apply_param_xmod_mode},
+     {PARAM_XMOD_SHAPE, apply_param_xmod_shape},
+     {PARAM_XMOD_RATIO, apply_param_xmod_ratio},
+     {PARAM_XMOD_DETUNE, apply_param_xmod_detune},
+     {PARAM_XMOD_SYMMETRY, apply_param_xmod_symmetry},
      // --- LFOs ---
      {PARAM_LFO1_WAVEFORM, apply_param_lfo1_waveform},
      {PARAM_LFO2_WAVEFORM, apply_param_lfo2_waveform},
@@ -983,8 +1004,12 @@ static void SRAM_HOT(apply_param_adsr3_release)(int16_t v) { ADSR3_release = (ui
   setSyncMode();
   
   subOscDivide      = (uint8_t)presetParamShadow[PARAM_SUBOSC_DIVIDE];
-  crossmod_depth    = (uint16_t)presetParamShadow[PARAM_CROSSMOD_DEPTH];
-  crossmod_mode     = (uint8_t)presetParamShadow[PARAM_CROSSMOD_MODE];
+  crossmod_depth    = (uint16_t)presetParamShadow[PARAM_XMOD_DEPTH];
+  crossmod_mode     = (uint8_t)presetParamShadow[PARAM_XMOD_MODE];
+  crossmod_shape    = (uint8_t)presetParamShadow[PARAM_XMOD_SHAPE];
+  crossmod_ratio    = (uint8_t)presetParamShadow[PARAM_XMOD_RATIO];
+  crossmod_detune   = (uint8_t)presetParamShadow[PARAM_XMOD_DETUNE];
+  crossmod_symmetry = (uint8_t)presetParamShadow[PARAM_XMOD_SYMMETRY];
 
   LFO1Waveform      = (uint8_t)presetParamShadow[PARAM_LFO1_WAVEFORM];
   LFO1_class.setWaveForm(LFO1Waveform);

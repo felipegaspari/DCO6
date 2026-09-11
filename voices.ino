@@ -538,16 +538,16 @@ void SRAM_HOT(voice_task_float)() {
   // Corrected: Uses 'const volatile float*' to match multicore definitions in
   // mod_matrix_engine.h while retaining __restrict.
   // =========================================================================
-  const volatile uint8_t*         __restrict vn_osc1    = VOICE_NOTE_OSC1;
-  const volatile uint8_t*         __restrict vn_osc2    = VOICE_NOTE_OSC2;
-  const volatile float*  __restrict m_pitch_f  = matrix_pitch_mod_f;
-  const volatile float*  __restrict m_osc1_f   = matrix_osc1_pitch_mod_f;
-  const volatile float*  __restrict m_osc2_f   = matrix_osc2_pitch_mod_f;
-  const int32_t*         __restrict m_pw       = (const int32_t*)matrix_pw_mod;
-  const int32_t*         __restrict m_xmod     = (const int32_t*)matrix_xmod_mod;
-  const int16_t*         __restrict adsr3_lvl  = ADSR3Level_q15;
-  volatile uint8_t*      __restrict n_on_flag  = note_on_flag;
-  volatile bool*         __restrict n_on_flag_f = note_on_flag_flag;
+  const volatile uint8_t*  __restrict vn_osc1     = VOICE_NOTE_OSC1;
+  const volatile uint8_t*  __restrict vn_osc2     = VOICE_NOTE_OSC2;
+  const volatile float*    __restrict m_pitch_f   = matrix_pitch_mod_f;
+  const volatile float*    __restrict m_osc1_f    = matrix_osc1_pitch_mod_f;
+  const volatile float*    __restrict m_osc2_f    = matrix_osc2_pitch_mod_f;
+  const int32_t*           __restrict m_pw        = (const int32_t*)matrix_pw_mod;
+  const int32_t*           __restrict m_xmod      = (const int32_t*)matrix_xmod_mod;
+  const volatile int16_t*  __restrict adsr3_lvl   = ADSR3Level_q15_volatile;
+  volatile uint8_t*        __restrict n_on_flag   = note_on_flag;
+  volatile bool*           __restrict n_on_flag_f = note_on_flag_flag;
 
   const float masterTuning_local = masterTuning_f;
   const float OSC1_detune_local  = OSC1_detune_f;
@@ -591,6 +591,27 @@ void SRAM_HOT(voice_task_float)() {
   // ----------------------------
 
   const uint8_t sm = syncMode;
+
+    // NEW: Pre-calculate PIO parameters for ALL 8 oscillators once!
+  // This removes 8 function calls, 8 branches, and 8 array lookups from the inner loop.
+  const uint32_t sync_chunks = soft_sync_chunks_clamped();
+  const uint32_t sync_w = PIO_RAMP_WEIGHT_BY_CHUNKS[sync_chunks];
+  const uint32_t sync_k = PIO_PERIOD_OVERHEAD_BY_CHUNKS[sync_chunks];
+
+  uint32_t osc_w[NUM_OSCILLATORS];
+  uint32_t osc_k[NUM_OSCILLATORS];
+
+  _Pragma("GCC unroll 4")
+  for (int j = 0; j < NUM_OSCILLATORS; ++j) {
+      if (osc_uses_sync_program[j]) {
+          osc_w[j] = sync_w;
+          osc_k[j] = sync_k;
+      } else {
+          osc_w[j] = PIO_RAMP_WEIGHT_FREE;
+          osc_k[j] = PIO_PERIOD_OVERHEAD_FREE;
+      }
+  }
+
   BENCH_END(vt_task_prep);
 
   // =========================================================================
@@ -781,8 +802,8 @@ void SRAM_HOT(voice_task_float)() {
     BENCH_END(vt_modifiers);
 
 
-    // BENCH_BEGIN(vt_freq_scale_x);
-    // BENCH_END(vt_freq_scale_x);
+    BENCH_BEGIN(vt_freq_scale_x);
+    BENCH_END(vt_freq_scale_x);
 
     BENCH_BEGIN(vt_ratio_interp);
     // for testing and debug
@@ -802,66 +823,6 @@ void SRAM_HOT(voice_task_float)() {
 
     BENCH_END(vt_freq_scale_post);
 
-
-    // CROSS MODULATION
-    // =============================================================================
-    // LINEAR / EXPONENTIAL FM CROSSMOD VERSION
-    // =============================================================================
-//      BENCH_BEGIN(vt_cross_mod);
-// // --- USER TWEAK ZONE ---
-//       // Linear depth max 0.92f: swings between 8% and 192% of pitch symmetrically in Hz
-//       static constexpr float MAX_LIN_DEPTH    = 2.50f; 
-//       // Exponential depth 2.0 octaves: swings between 25% and 400% of pitch in octaves
-//       static constexpr float MAX_EXPO_OCTAVES = 3.5f; 
-//       // -----------------------
-
-//       float pio_freqA_Hz = freqA_Hz;
-//       float pio_freqB_Hz = freqB_Hz;
-
-//       int32_t total_mod_q15 = base_xmod + m_xmod[i];
-
-//       if (total_mod_q15 > 0) {
-//           if (total_mod_q15 > 32767) total_mod_q15 = 32767;
-
-//           // Advance Osc B shadow phase
-//           uint32_t phase = shadow_phase_osc2_q32[i];
-//           phase += (uint32_t)(freqB_Hz * hz_to_phase_inc);
-//           shadow_phase_osc2_q32[i] = phase;
-
-//           // Fast Branchless Triangle wave generation (-1.0f to +1.0f)
-//           uint32_t p2 = phase << 1;
-//           uint32_t tri_u = (phase & 0x80000000) ? ~p2 : p2;
-//           float shadow_tri = (float)tri_u * 4.65661287e-10f - 1.0f;
-
-// // Generate Sawtooth from Osc B phase (-1.0f to +1.0f):
-// float shadow_saw = ((float)phase * 4.65661287e-10f) - 1.0f;
-
-// if (crossmod_mode != 0) {
-//     // LINEAR MODE: Modulated by TRIANGLE wave
-//     // Sound: Pure, glassy, bell-like, clean FM chimes (DX7 style)
-//     const float lin_depth = (float)total_mod_q15 * (MAX_LIN_DEPTH / 32767.0f);
-//     pio_freqA_Hz = freqA_Hz * (1.0f + (shadow_tri * lin_depth));
-
-// } else {
-//     // EXPONENTIAL MODE: Modulated by SAWTOOTH wave
-//     // Sound: Tearing, snarling, massive analog growl (Prophet-5 style)
-//     const float depth_scaler_tuned = 0.00003051757f * MAX_EXPO_OCTAVES;
-//     float mod_depth = (float)total_mod_q15 * depth_scaler_tuned;
-//     float depth_sq = mod_depth * mod_depth;
-//     float exact_bias = (0.1153f - (0.0016f * depth_sq)) * depth_sq;
-
-//     // Use shadow_saw here instead of shadow_tri!
-//     float octaves = (shadow_saw * mod_depth) - exact_bias;
-//     pio_freqA_Hz = freqA_Hz * exp2f(octaves);
-// }
-
-//           if (pio_freqA_Hz < 10.0f) {
-//               pio_freqA_Hz = 10.0f;
-//           }
-//       }
-//      BENCH_END(vt_cross_mod);
-
-
     BENCH_BEGIN(vt_cross_mod);
 
     float pio_freqA_Hz = freqA_Hz;
@@ -879,56 +840,19 @@ void SRAM_HOT(voice_task_float)() {
 
     BENCH_END(vt_cross_mod);
 
-    // =============================================================================
-    // EXPONENTIAL FM CROSSMOD VERSION with centered mode
-    // =============================================================================
-    // BENCH_BEGIN(vt_cross_mod);
-    // 
-    // // Initialize BOTH frequencies for clean state defaults
-    // float pio_freqA_Hz = freqA_Hz;
-    // float pio_freqB_Hz = freqB_Hz;
-
-    // int32_t total_mod_q15 = base_xmod + m_xmod[i];
-
-    // if (total_mod_q15 > 0) {
-    //     // Clamp
-    //     if (total_mod_q15 > 32767) total_mod_q15 = 32767;
-
-    //     // Advance Osc B shadow phase (Q32 wrap via native overflow)
-    //     uint32_t phase = shadow_phase_osc2_q32[i];
-    //     phase += (uint32_t)(freqB_Hz * hz_to_phase_inc);
-    //     shadow_phase_osc2_q32[i] = phase;
-
-    //     // Fast Branchless Triangle wave generation
-    //     uint32_t p2 = phase << 1;
-    //     uint32_t tri_u = (phase & 0x80000000) ? ~p2 : p2;
-    //     float shadow_tri = (float)tri_u * 4.65661287e-10f - 1.0f;
-
-    //     // Exponential FM with Optional Pitch Compensation
-    //     float mod_depth = (float)total_mod_q15 * depth_scaler;
-    //     
-    //     // If xmod_bias_coeff == 0.0f, the bias becomes 0.0f (vintage non-centered behavior)
-    //     float pitch_bias_octaves = xmod_bias_coeff * (mod_depth * mod_depth);
-    //     float octaves = (shadow_tri * mod_depth) - pitch_bias_octaves;
-
-    //     pio_freqA_Hz = freqA_Hz * fast_exp2f_audio(octaves);
-    // }
-    // BENCH_END(vt_cross_mod);
-
 
     BENCH_BEGIN(vt_clk_div);
 
     uint32_t total_cycles1 = clkdiv_live_total_cycles(sysClock_Hz_cached_float, pio_freqA_Hz);
     uint32_t total_cycles2 = clkdiv_live_total_cycles(sysClock_Hz_cached_float, pio_freqB_Hz);
-
+    
     uint32_t wA, kA, wB, kB;
     get_osc_params(DCO_A, wA, kA);
     get_osc_params(DCO_B, wB, kB);
-
+    
     uint32_t clk_div1 = pio_clk_div_for_y(total_cycles1, osc_last_y[DCO_A], wA, kA);
     uint32_t clk_div2 = pio_clk_div_for_y(total_cycles2, osc_last_y[DCO_B], wB, kB);
     BENCH_END(vt_clk_div);
-
 
     // Prep variables for retrig 
     BENCH_BEGIN(vt_note_retrig);
@@ -974,17 +898,21 @@ void SRAM_HOT(voice_task_float)() {
 
     BENCH_BEGIN(vt_range_pwm);
     // Calculate Range levels
-    if (character) {
-      // Proportional jitter: ±5% of this specific note's level
-      const int32_t amp_j_A = ((int32_t)chanLevel  * char_amp_mod_factor) >> 15;
-      const int32_t amp_j_B = ((int32_t)chanLevel2 * char_amp_mod_factor) >> 15;
+// 1. Do the math unconditionally. 
+// On the Cortex-M33, these multiplications and shifts execute in CPU registers 
+// in exactly 1-2 clock cycles. No stack spilling to SRAM required.
+const int32_t amp_j_A = ((int32_t)chanLevel  * char_amp_mod_factor) >> 15;
+const int32_t amp_j_B = ((int32_t)chanLevel2 * char_amp_mod_factor) >> 15;
 
-      RANGE_PWM[DCO_A] = character_clamp_amp((int32_t)chanLevel  + amp_j_A);
-      RANGE_PWM[DCO_B] = character_clamp_amp((int32_t)chanLevel2 + amp_j_B);
-    } else {
-      RANGE_PWM[DCO_A] = chanLevel;
-      RANGE_PWM[DCO_B] = chanLevel2;
-    }
+// 2. Hardware Saturation (See note below!)
+const int32_t char_val_A = character_clamp_amp((int32_t)chanLevel  + amp_j_A);
+const int32_t char_val_B = character_clamp_amp((int32_t)chanLevel2 + amp_j_B);
+
+// 3. Branchless Assignment (Ternary Operator)
+// The compiler translates this into an ARM "IT" (If-Then) block and a "MOV" instruction.
+// There is NO branch, NO pipeline flush, and execution time is 100% deterministic (zero jitter).
+RANGE_PWM[DCO_A] = character ? char_val_A : chanLevel;
+RANGE_PWM[DCO_B] = character ? char_val_B : chanLevel2;
     BENCH_END(vt_range_pwm);
 
     PIO pioN_A = pio[VOICE_TO_PIO[DCO_A]];

@@ -311,21 +311,6 @@ void SRAM_HOT(loop1)() {
     BENCH_END(loop1_pio_defer);
   }
 
-  if (timer50microsFlag2 == 1) {
-    // BENCH_BEGIN(loop1_cv_outs);
-    // update_CV_outs();
-    // BENCH_END(loop1_cv_outs);
-
-    BENCH_BEGIN(loop1_adsr_sync);
-    for (int i = 0; i < NUM_VOICES_TOTAL; i++) {
-      ADSR3Level_q15[i] = ADSR3Level_q15_volatile[i];
-      ADSR_VCA_Level_q15[i] = ADSR_VCA_Level_q15_volatile[i];
-      ADSR_VCF_Level_q15[i] = ADSR_VCF_Level_q15_volatile[i];
-      ADSR_VCF2_Level_q15[i] = ADSR_VCF2_Level_q15_volatile[i];
-    }
-    BENCH_END(loop1_adsr_sync);
-  }
-
   {
     BENCH_BEGIN(loop1_voice_task);
     voice_task_main();
