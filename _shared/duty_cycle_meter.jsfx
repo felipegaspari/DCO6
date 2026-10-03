@@ -1,0 +1,193 @@
+desc:Duty Cycle Meter (Scope)
+//tags: analysis metering utility oscilloscope
+//author: Claude
+
+slider1:0.0<-5,5,0.001>Threshold (center)
+slider2:0.05<0,0.5,0.001>Hysteresis
+slider3:0<0,1,1{Show frequency,Show period (ms)}>Second readout
+slider4:20<1,150,0.1>Scope window (ms)
+slider5:1.2<0.1,5,0.1>Scope range (±)
+
+@init
+buf_size = 8192;
+wavebuf = 0;
+statebuf = wavebuf + buf_size;
+write_idx = 0;
+
+state = 0;
+sample_counter = 0;
+last_rise = -1;
+high_width = 0;
+period = 0;
+duty = 0;
+freq = 0;
+
+dragging = 0;
+
+@sample
+in = spl0;
+rise_t = slider1 + slider2*0.5;
+fall_t = slider1 - slider2*0.5;
+
+new_state = state;
+(state == 0 && in > rise_t) ? new_state = 1;
+(state == 1 && in < fall_t) ? new_state = 0;
+
+// rising edge: close out the previous full period, compute duty + freq
+(new_state == 1 && state == 0) ? (
+  last_rise >= 0 ? (
+    period = sample_counter - last_rise;
+    period > 0 ? (
+      duty = high_width / period;
+      freq = srate / period;
+    );
+  );
+  last_rise = sample_counter;
+);
+
+// falling edge: record how long the pulse stayed high
+(new_state == 0 && state == 1) ? (
+  last_rise >= 0 ? high_width = sample_counter - last_rise;
+);
+
+state = new_state;
+sample_counter += 1;
+
+wavebuf[write_idx] = in;
+statebuf[write_idx] = state;
+write_idx = (write_idx + 1) % buf_size;
+
+
+@gfx 480 480
+MARGIN = 10;
+GRAPH_TOP = 10;
+STRIP_H = 14;
+BOTTOM_H = 280; // Expanded to fit the massive font
+
+GRAPH_H = gfx_h - GRAPH_TOP - BOTTOM_H;
+GRAPH_H < 50 ? GRAPH_H = 50;
+GRAPH_BOTTOM = GRAPH_TOP + GRAPH_H;
+STRIP_TOP = GRAPH_BOTTOM + 8;
+
+graph_w = gfx_w - MARGIN*2;
+graph_w < 20 ? graph_w = 20;
+
+win_samples = min(buf_size, floor(srate * slider4 / 1000));
+win_samples <= 1 ? win_samples = 2;
+
+start = (write_idx - win_samples + buf_size*2) % buf_size;
+
+// Manual scale via slider 5
+amp_hi = slider5;
+amp_lo = -slider5;
+span = amp_hi - amp_lo;
+
+// click/drag inside the graph area sets the threshold live
+(mouse_cap & 1) && mouse_y >= GRAPH_TOP && mouse_y <= GRAPH_BOTTOM && mouse_x >= MARGIN && mouse_x <= gfx_w - MARGIN ? (
+  dragging = 1;
+) : (
+  (mouse_cap & 1) == 0 ? dragging = 0;
+);
+
+dragging ? (
+  new_thresh = amp_hi - (mouse_y - GRAPH_TOP)/GRAPH_H * span;
+  new_thresh = max(-5, min(5, new_thresh));
+  slider1 = new_thresh;
+  slider_automate(slider1);
+);
+
+gfx_set(0.05,0.05,0.06,1);
+gfx_rect(0,0,gfx_w,gfx_h);
+
+// graph background
+gfx_set(0.15,0.15,0.17,1);
+gfx_rect(MARGIN, GRAPH_TOP, graph_w, GRAPH_H);
+
+// zero line (only if zero falls within the current view)
+(amp_lo <= 0 && 0 <= amp_hi) ? (
+  gfx_set(0.3,0.3,0.32,1);
+  zero_y = GRAPH_TOP + GRAPH_H * (1 - (0 - amp_lo)/span);
+  gfx_line(MARGIN, zero_y, gfx_w-MARGIN, zero_y);
+);
+
+// hysteresis band + threshold line
+rise_y = GRAPH_TOP + GRAPH_H * (1 - (rise_t - amp_lo)/span);
+fall_y = GRAPH_TOP + GRAPH_H * (1 - (fall_t - amp_lo)/span);
+gfx_set(0.9,0.6,0.15,0.25);
+gfx_rect(MARGIN, min(rise_y,fall_y), graph_w, abs(fall_y-rise_y));
+
+thresh_y = GRAPH_TOP + GRAPH_H * (1 - (slider1 - amp_lo)/span);
+gfx_set(1,0.7,0.2,1);
+gfx_line(MARGIN, thresh_y, gfx_w-MARGIN, thresh_y);
+
+gfx_setfont(1, "Arial", 12);
+gfx_x = gfx_w - MARGIN - 46; gfx_y = thresh_y - 14;
+sprintf(#s4, "%.3f", slider1);
+gfx_drawstr(#s4);
+
+// waveform trace
+gfx_set(0.2,0.9,0.5,1);
+i = 0;
+loop(win_samples-1,
+  idx0 = (start + i) % buf_size;
+  idx1 = (start + i + 1) % buf_size;
+  x0 = MARGIN + graph_w * (i/win_samples);
+  x1 = MARGIN + graph_w * ((i+1)/win_samples);
+  y0 = GRAPH_TOP + GRAPH_H * (1 - (wavebuf[idx0] - amp_lo)/span);
+  y1 = GRAPH_TOP + GRAPH_H * (1 - (wavebuf[idx1] - amp_lo)/span);
+  gfx_line(x0, y0, x1, y1);
+  i += 1;
+);
+
+// detected high/low state strip -- a direct visual read of the duty cycle
+i = 0;
+loop(win_samples-1,
+  idx0 = (start + i) % buf_size;
+  x0 = MARGIN + graph_w * (i/win_samples);
+  x1 = MARGIN + graph_w * ((i+1)/win_samples);
+  statebuf[idx0] > 0.5 ? gfx_set(0.2,0.9,0.5,1) : gfx_set(0.25,0.25,0.28,1);
+  gfx_rect(x0, STRIP_TOP, max(1,x1-x0), STRIP_H);
+  i += 1;
+);
+
+// ---- MASSIVE TEXT READOUT ----
+pct = duty * 100;
+pct = max(0, min(100, pct));
+sprintf(#duty_str, "%.1f %%", pct);
+
+// Set a massive bold font
+gfx_setfont(2, "Arial", 180, 'b');
+gfx_measurestr(#duty_str, str_w, str_h);
+
+// Center it horizontally
+text_x = (gfx_w - str_w) * 0.5;
+text_x < MARGIN ? text_x = MARGIN;
+text_y = STRIP_TOP + STRIP_H + 20;
+
+// Draw a subtle amber shadow/glow for depth
+gfx_set(1, 0.55, 0.05, 0.15);
+gfx_x = text_x + 5; gfx_y = text_y + 5;
+gfx_drawstr(#duty_str);
+
+// Draw the main bright text
+gfx_set(1, 0.75, 0.15, 1);
+gfx_x = text_x; gfx_y = text_y;
+gfx_drawstr(#duty_str);
+
+// ---- smaller technical readouts below the big text ----
+FREQ_Y = text_y + str_h + 10;
+TRIG_Y = FREQ_Y + 20;
+
+gfx_setfont(1, "Courier New", 14);
+gfx_set(0.75, 0.55, 0.25, 1);
+gfx_x = MARGIN; gfx_y = FREQ_Y;
+slider3 == 0 ? (
+  sprintf(#s2, "FREQ: %.1f Hz", freq);
+) : (
+  period > 0 ? sprintf(#s2, "PERIOD: %.3f ms", 1000*period/srate) : sprintf(#s2, "PERIOD: -- ms");
+);
+gfx_drawstr(#s2);
+
+gfx_x = MARGIN; gfx_y = TRIG_Y;
+sprintf(#s3, "TRIGGER: %.3f   HYST: %.3f   (drag graph to set)", slider1, slider2);
+gfx_drawstr(#s3);
