@@ -1,0 +1,174 @@
+#ifndef __NOTE_LIST_H__
+#define __NOTE_LIST_H__
+
+#include <stdint.h>
+#include "pico/platform.h"
+
+#define NOTE_C_1 8.176
+#define NOTE_CS_1 8.662
+#define NOTE_D_1 9.177
+#define NOTE_DS_1 9.723
+#define NOTE_E_1 10.301
+#define NOTE_F_1 10.913
+#define NOTE_FS_1 11.562
+#define NOTE_G_1 12.250
+#define NOTE_GS_1 12.978
+#define NOTE_A_1 13.750
+#define NOTE_AS_1 14.568
+#define NOTE_B_1 15.434	 
+#define NOTE_C0 16.35
+#define NOTE_CS0 17.32
+#define NOTE_D0 18.35
+#define NOTE_DS0 19.45
+#define NOTE_E0 20.60
+#define NOTE_F0 21.83
+#define NOTE_FS0 23.12
+#define NOTE_G0 24.50
+#define NOTE_GS0 25.96
+#define NOTE_A0 27.50
+#define NOTE_AS0 29.14
+#define NOTE_B0 30.87
+#define NOTE_C1 32.70
+#define NOTE_CS1 34.65
+#define NOTE_D1 36.71
+#define NOTE_DS1 38.89
+#define NOTE_E1 41.20
+#define NOTE_F1 43.65
+#define NOTE_FS1 46.25
+#define NOTE_G1 49.00
+#define NOTE_GS1 51.91
+#define NOTE_A1 55.00
+#define NOTE_AS1 58.27
+#define NOTE_B1 61.74
+#define NOTE_C2 65.41
+#define NOTE_CS2 69.30
+#define NOTE_D2 73.42
+#define NOTE_DS2 77.78
+#define NOTE_E2 82.41
+#define NOTE_F2 87.31
+#define NOTE_FS2 92.50
+#define NOTE_G2 98.00
+#define NOTE_GS2 103.85
+#define NOTE_A2 110.00
+#define NOTE_AS2 116.54
+#define NOTE_B2 123.47
+#define NOTE_C3 130.81
+#define NOTE_CS3 138.59
+#define NOTE_D3 146.83
+#define NOTE_DS3 155.56
+#define NOTE_E3 164.81
+#define NOTE_F3 174.61
+#define NOTE_FS3 185.00
+#define NOTE_G3 196.00
+#define NOTE_GS3 207.65
+#define NOTE_A3 220.00
+#define NOTE_AS3 233.08
+#define NOTE_B3 246.94
+#define NOTE_C4 261.63
+#define NOTE_CS4 277.18
+#define NOTE_D4 293.66
+#define NOTE_DS4 311.13
+#define NOTE_E4 329.63
+#define NOTE_F4 349.23
+#define NOTE_FS4 369.99
+#define NOTE_G4 392.00
+#define NOTE_GS4 415.30
+#define NOTE_A4 440.00
+#define NOTE_AS4 466.16
+#define NOTE_B4 493.88
+#define NOTE_C5 523.25
+#define NOTE_CS5 554.37
+#define NOTE_D5 587.33
+#define NOTE_DS5 622.25
+#define NOTE_E5 659.25
+#define NOTE_F5 698.46
+#define NOTE_FS5 739.99
+#define NOTE_G5 783.99
+#define NOTE_GS5 830.61
+#define NOTE_A5 880.00
+#define NOTE_AS5 932.33
+#define NOTE_B5 987.77
+#define NOTE_C6 1046.50
+#define NOTE_CS6 1108.73
+#define NOTE_D6 1174.66
+#define NOTE_DS6 1244.51
+#define NOTE_E6 1318.51
+#define NOTE_F6 1396.91
+#define NOTE_FS6 1479.98
+#define NOTE_G6 1567.98
+#define NOTE_GS6 1661.22
+#define NOTE_A6 1760.00
+#define NOTE_AS6 1864.66
+#define NOTE_B6 1975.53
+#define NOTE_C7 2093.00
+#define NOTE_CS7 2217.46
+#define NOTE_D7 2349.32
+#define NOTE_DS7 2489.02
+#define NOTE_E7 2637.02
+#define NOTE_F7 2793.83
+#define NOTE_FS7 2959.96
+#define NOTE_G7 3135.96
+#define NOTE_GS7 3322.44
+#define NOTE_A7 3520.00
+#define NOTE_AS7 3729.31
+#define NOTE_B7 3951.07
+#define NOTE_C8 4186.00
+#define NOTE_CS8 4434.92
+#define NOTE_D8 4698.63
+#define NOTE_DS8 4978.03
+#define NOTE_E8 5274.04
+#define NOTE_F8 5587.65
+#define NOTE_FS8 5919.91
+#define NOTE_G8 6271.93
+#define NOTE_GS8 6644.88
+#define NOTE_A8 7040.00
+#define NOTE_AS8 7458.62
+#define NOTE_B8 7902.13
+#define NOTE_C9 8372.018
+#define NOTE_CS9 8869.84
+#define NOTE_D9 9397.27
+#define NOTE_DS9 9956.06
+#define NOTE_E9 10548.08
+#define NOTE_F9 11175.30
+#define NOTE_FS9 11839.82
+#define NOTE_G9 12543.85
+#define NOTE_GS9 13289.75
+#define NOTE_A9 14080.00
+#define NOTE_AS9 14917.24
+#define NOTE_B9 15804.27
+#define NOTE_C10 16744.04
+#define NOTE_CS10 17739.69
+#define NOTE_D10 18794.545
+#define NOTE_DS10 19912.13
+
+__not_in_flash("pitch_tables") static constexpr float sNotePitches[] = {
+    NOTE_C_1, NOTE_CS_1, NOTE_D_1, NOTE_DS_1, NOTE_E_1, NOTE_F_1, NOTE_FS_1, NOTE_G_1, NOTE_GS_1, NOTE_A_1, NOTE_AS_1, NOTE_B_1,
+    NOTE_C0, NOTE_CS0, NOTE_D0, NOTE_DS0, NOTE_E0, NOTE_F0, NOTE_FS0, NOTE_G0, NOTE_GS0, NOTE_A0, NOTE_AS0, NOTE_B0,
+    NOTE_C1, NOTE_CS1, NOTE_D1, NOTE_DS1, NOTE_E1, NOTE_F1, NOTE_FS1, NOTE_G1, NOTE_GS1, NOTE_A1, NOTE_AS1, NOTE_B1,
+    NOTE_C2, NOTE_CS2, NOTE_D2, NOTE_DS2, NOTE_E2, NOTE_F2, NOTE_FS2, NOTE_G2, NOTE_GS2, NOTE_A2, NOTE_AS2, NOTE_B2,
+    NOTE_C3, NOTE_CS3, NOTE_D3, NOTE_DS3, NOTE_E3, NOTE_F3, NOTE_FS3, NOTE_G3, NOTE_GS3, NOTE_A3, NOTE_AS3, NOTE_B3,
+    NOTE_C4, NOTE_CS4, NOTE_D4, NOTE_DS4, NOTE_E4, NOTE_F4, NOTE_FS4, NOTE_G4, NOTE_GS4, NOTE_A4, NOTE_AS4, NOTE_B4,
+    NOTE_C5, NOTE_CS5, NOTE_D5, NOTE_DS5, NOTE_E5, NOTE_F5, NOTE_FS5, NOTE_G5, NOTE_GS5, NOTE_A5, NOTE_AS5, NOTE_B5,
+    NOTE_C6, NOTE_CS6, NOTE_D6, NOTE_DS6, NOTE_E6, NOTE_F6, NOTE_FS6, NOTE_G6, NOTE_GS6, NOTE_A6, NOTE_AS6, NOTE_B6,
+    NOTE_C7, NOTE_CS7, NOTE_D7, NOTE_DS7, NOTE_E7, NOTE_F7, NOTE_FS7, NOTE_G7, NOTE_GS7, NOTE_A7, NOTE_AS7, NOTE_B7,
+    NOTE_C8, NOTE_CS8, NOTE_D8, NOTE_DS8, NOTE_E8, NOTE_F8, NOTE_FS8, NOTE_G8, NOTE_GS8, NOTE_A8, NOTE_AS8, NOTE_B8, 
+    NOTE_C9, NOTE_CS9, NOTE_D9, NOTE_DS9, NOTE_E9, NOTE_F9, NOTE_FS9, NOTE_G9, NOTE_GS9, NOTE_A9, NOTE_AS9, NOTE_B9, 
+    NOTE_C10, NOTE_CS10, NOTE_D10, NOTE_DS10};
+
+// Q24 fixed-point note frequency table (Hz * 2^24) stored as 64-bit to avoid overflow
+__not_in_flash("pitch_tables") static constexpr int64_t sNotePitches_q24[] = {
+    (int64_t)(NOTE_C_1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_CS_1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_D_1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_DS_1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_E_1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_F_1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_FS_1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_G_1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_GS_1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_A_1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_AS_1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_B_1 * (double)(1ULL << 24) + 0.5),
+    (int64_t)(NOTE_C0 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_CS0 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_D0 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_DS0 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_E0 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_F0 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_FS0 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_G0 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_GS0 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_A0 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_AS0 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_B0 * (double)(1ULL << 24) + 0.5),
+    (int64_t)(NOTE_C1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_CS1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_D1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_DS1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_E1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_F1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_FS1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_G1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_GS1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_A1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_AS1 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_B1 * (double)(1ULL << 24) + 0.5),
+    (int64_t)(NOTE_C2 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_CS2 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_D2 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_DS2 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_E2 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_F2 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_FS2 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_G2 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_GS2 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_A2 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_AS2 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_B2 * (double)(1ULL << 24) + 0.5),
+    (int64_t)(NOTE_C3 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_CS3 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_D3 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_DS3 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_E3 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_F3 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_FS3 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_G3 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_GS3 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_A3 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_AS3 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_B3 * (double)(1ULL << 24) + 0.5),
+    (int64_t)(NOTE_C4 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_CS4 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_D4 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_DS4 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_E4 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_F4 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_FS4 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_G4 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_GS4 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_A4 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_AS4 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_B4 * (double)(1ULL << 24) + 0.5),
+    (int64_t)(NOTE_C5 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_CS5 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_D5 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_DS5 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_E5 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_F5 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_FS5 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_G5 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_GS5 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_A5 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_AS5 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_B5 * (double)(1ULL << 24) + 0.5),
+    (int64_t)(NOTE_C6 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_CS6 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_D6 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_DS6 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_E6 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_F6 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_FS6 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_G6 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_GS6 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_A6 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_AS6 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_B6 * (double)(1ULL << 24) + 0.5),
+    (int64_t)(NOTE_C7 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_CS7 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_D7 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_DS7 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_E7 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_F7 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_FS7 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_G7 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_GS7 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_A7 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_AS7 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_B7 * (double)(1ULL << 24) + 0.5),
+    (int64_t)(NOTE_C8 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_CS8 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_D8 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_DS8 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_E8 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_F8 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_FS8 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_G8 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_GS8 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_A8 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_AS8 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_B8 * (double)(1ULL << 24) + 0.5), 
+    (int64_t)(NOTE_C9 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_CS9 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_D9 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_DS9 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_E9 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_F9 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_FS9 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_G9 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_GS9 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_A9 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_AS9 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_B9 * (double)(1ULL << 24) + 0.5), 
+    (int64_t)(NOTE_C10 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_CS10 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_D10 * (double)(1ULL << 24) + 0.5), (int64_t)(NOTE_DS10 * (double)(1ULL << 24) + 0.5)
+};
+
+#endif
