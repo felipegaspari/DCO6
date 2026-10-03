@@ -447,6 +447,36 @@ uint32_t get_osc_clk_div(uint8_t osc, float freqHz) {
   return clk_div;
 }
 
+void dco_set_osc_freq(uint8_t osc, float freqHz) {
+  if (osc >= NUM_OSCILLATORS) return;
+
+  if (osc & 1u) {
+    // OSC B: DMA ring owns TXF; pitch is SM clkdiv (bake_waveform path).
+    const uint8_t voice = (uint8_t)(osc >> 1);
+    const uint32_t total_cycles =
+        (freqHz > 0.0f) ? clkdiv_live_total_cycles(sysClock_Hz_cached_float, freqHz)
+                        : 0u;
+    if (total_cycles) {
+      dco_wave_set_clkdiv(voice, total_cycles);
+    }
+    return;
+  }
+
+  // OSC A: classic period word via TXF.
+  PIO pioN = pio[VOICE_TO_PIO[osc]];
+  const uint sm = VOICE_TO_SM[osc];
+  if (!(freqHz > 0.0f)) {
+    pio_sm_put(pioN, sm, 0);
+    pio_sm_exec(pioN, sm, pio_encode_pull(false, false));
+    osc_last_clk_div[osc] = 0;
+    return;
+  }
+  const uint32_t clk_div = get_osc_clk_div(osc, freqHz);
+  pio_sm_put(pioN, sm, clk_div);
+  pio_sm_exec(pioN, sm, pio_encode_pull(false, false));
+  osc_last_clk_div[osc] = clk_div;
+}
+
 //===================================================================================================
 // TRIANGLE WAVEFORM BAKING FUNCTIONS
 //===================================================================================================
