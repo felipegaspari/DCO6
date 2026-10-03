@@ -231,7 +231,13 @@ void DCO_calibration() {
     if (fine) {
       tableOk = refine_DCO_amp_table(ctx);
     } else if (autotuneAmpMethod == AMP_METHOD_FREQ_TRACE) {
-      tableOk = calibrate_DCO_freq_trace(ctx);
+      // Linker canary: undefined if search_impl is the old freq-ladder TU.
+      if (kFreqTraceAmpGeomGridBuilder != kFreqTraceAmpGeomGridMagicExpected) {
+        Serial.println("[FREQ_TRACE_GUARD] wrong builder magic — stale search_impl linked");
+        tableOk = false;
+      } else {
+        tableOk = calibrate_DCO_freq_trace(ctx);
+      }
     } else {
       // The classic path inherits the two header pairs written by
       // restart_DCO_calibration(): the amp-comp-0 placeholder (measured later

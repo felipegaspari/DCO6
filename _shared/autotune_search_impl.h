@@ -3,9 +3,14 @@
 
 #include "../include_all.h"
 
-// Canary: autotune_search.ino #errors if this is missing, so a stale
-// DCO-SHARED-LIBRARIES symlink cannot silently revive the freq-ladder path.
+// Canary: autotune_search.ino #errors if this macro is missing. A linker
+// symbol below is also referenced from autotune_impl.h so a stale search_impl
+// TU that still defines calibrate_DCO_freq_trace but lacks this symbol fails
+// at link — the preprocessor canary alone can be bypassed by an old
+// autotune_search.ino that never checks the macro.
 #define FREQ_TRACE_AMP_GEOM_GRID 1
+constexpr uint32_t kFreqTraceAmpGeomGridMagic = 0x414D4747u;  // 'AMGG'
+const uint32_t kFreqTraceAmpGeomGridBuilder = kFreqTraceAmpGeomGridMagic;
 
 // =============================================================================
 // autotune_search_impl.h — search-based DCO amplitude-compensation calibration.

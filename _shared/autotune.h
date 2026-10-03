@@ -451,6 +451,11 @@ static inline void settle_for_freq(double freqHz) {
   delay(settleMs);
 }
 
+// Implemented only by the geometric FREQ_TRACE builder (autotune_search_impl.h).
+// Referenced from the FREQ_TRACE call site so a stale search TU cannot link.
+extern const uint32_t kFreqTraceAmpGeomGridBuilder;
+constexpr uint32_t kFreqTraceAmpGeomGridMagicExpected = 0x414D4747u;  // 'AMGG'
+
 // --- Implemented in autotune_search_impl.h ---
 
 // Allowed |gap| in microseconds for a frequency and duty-error fraction.
