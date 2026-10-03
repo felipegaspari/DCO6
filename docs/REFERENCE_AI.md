@@ -349,16 +349,16 @@ Related docs:
   - `calibrate_DCO()` — search-based amp-comp loop: interpolated initial guess per note,
     sign-change detection with neighbour probing, ±1/±2 stepping clamped to per-note bounds,
     iteration/time/timeout guards.
-  - `find_highest_freq()` / `find_lowest_freq()` — bisection at full RANGE PWM via
-    `voice_task_autotune(4, …)` and quadratic extrapolation to PWM 0.
+  - `find_highest_freq()` / `find_lowest_freq()` — CLASSIC top-out measures frequency at
+    fixed amp `DIV_COUNTER` via `find_freq_for_duty50`; lowest is fit/extrapolation to PWM 0.
   - `amp0_search_band()` / `amp0_prescan()` / `measure_lowest_freq_at_amp0()` /
     `apply_measured_lowest_freq()` — the shared amp-comp-0 endpoint: a wide band under the
     first measured pair (`kAmp0BandRatio`, floored at `kAmp0MinFreqHz`), a scan for two
     readings bracketing 50 % duty, a bounded search with amp comp fixed at 0, accepted only
     within `kEndpointAcceptDutyPct`.
-  - `calibrate_DCO_freq_trace()` — the `FREQ_TRACE` builder: two manual points (440 Hz anchor +
-    trim note) and a bootstrap cluster feed a curve model, ladder spacing is derived from it,
-    rungs are traced with fixed-amp frequency bisection, endpoints measured last.
+  - `calibrate_DCO_freq_trace()` — the `FREQ_TRACE` builder: geometric amp grid from manual
+    `A_L` through `DIV_COUNTER` (last rung), nearest-replace `ampComp440`, measure freq at
+    duty 50% (ups from ~440 then lows); pair 0 amp0 floor 0.1 Hz; sentinel amp = `DIV_COUNTER`.
   - Interpolation helpers: `quadraticInterpolation`, `logarithmicInterpolation`,
     `linearInterpolation`, `expInterpolationSolveY()`.
 
