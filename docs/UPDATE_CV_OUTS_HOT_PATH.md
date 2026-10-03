@@ -1,199 +1,252 @@
 # `update_CV_outs` Hot-Path Map
 
-Readable map of the ~10 kHz CV path after the dual-MCU optimization. Live source of truth is the `.ino` / `.h` files linked below — this doc does not paste full bodies.
+Readable map of the CV / modulation path on the DCO. Live source of truth is
+[`cv_out.ino`](../cv_out.ino) — this doc does not paste full bodies.
 
-**How to read this doc:** call graph and file map below; **live combine formulas** in [§ Hot-path math](#hot-path-math-fixed--shipping); **mod depth baking** (`/512` vs `/1024`, when to call bakers) in [`CV_MOD_SCALES.md`](CV_MOD_SCALES.md).
+> 🔴 **Rewritten 2026-09-16.** The function was restructured into a staged polyphonic pipeline
+> and **no longer computes or writes VCA / VCF / resonance CVs on this board** — the Mainboard
+> owns that analog. The previous revision documented the DCO3/monosynth shape: VCA and VCF
+> combine formulas, `mod_matrix_apply_cv()`, `mod_matrix_read_source_q15()`, a Core 1 call site
+> and a "~10 kHz" rate. None of that matches the current code. See
+> [§7](#7-what-changed) for the migration table.
 
-**Always-on (both MCUs):** Q15 mod matrix, `lerp_0_4095` (`>>12`), keytrack `note - 60`, integer reso comp `(span * 36) >> 8`, PWM `level_wrap_for_slice` LUT.
+**How to read this doc:** the staged pipeline in [§2](#2-the-five-stage-pipeline) is the whole
+function. Mod-depth baking (`/512` vs `/1024`, when to call the bakers) stays in
+[`CV_MOD_SCALES.md`](CV_MOD_SCALES.md). The matrix itself is [`MOD_MATRIX.md`](MOD_MATRIX.md).
 
-**Flag-gated:** `USE_FLOAT_CV_OUTS` — float VCA/VCF/keytrack/drift/velocity (A/B only) vs fixed Q15 / integer path (**default off** on both MCUs → `cv=FIXED`). See [`ENGINE_OPTIONS.md`](ENGINE_OPTIONS.md). LFO/ADSR mod sources are Q15 pass-through.
+---
 
-**RP2040 A/B (directional, 250 MHz):** latest `cv=FIXED` `update_CV_outs` mean ~13 µs / ~7%win (earlier post-opt FIXED was ~27 µs / ~13%win; `cv=FLOAT` A/B ~53 µs / ~20%win). Keep FIXED for shipping. Details / reading rules: [`BENCHMARKING.md`](BENCHMARKING.md).
+## 1. Where it runs
 
-## Call graph
+**Core 0, from `loop()`, every iteration** — not Core 1, and not gated behind a timer flag:
+
+```cpp
+BENCH_BEGIN(loop0_cv_outs);
+update_CV_outs();
+BENCH_END(loop0_cv_outs);
+```
+
+The bench probe is `loop0_cv_outs`. The banner still prints `cv=FLOAT|FIXED` from
+`USE_FLOAT_CV_OUTS`, which on this tree is **on for RP2350** and off for RP2040 — the opposite of
+what older docs claimed.
+
+Declared `void SRAM_HOT(update_CV_outs)()`, so it is pinned into SRAM
+([`MEMORY.md`](MEMORY.md)).
+
+---
+
+## 2. The five-stage pipeline
 
 ```mermaid
 flowchart TD
-  loop1["DCO.ino loop1 call site"] --> updateCV["update_CV_outs"]
-  updateCV --> lerp["lerp_0_4095"]
-  updateCV --> accum["mod_matrix_accumulate"]
-  accum --> readSrc["mod_matrix_read_source_q15"]
-  accum --> pitchSide["matrix_pitch_mod_q24"]
-  updateCV --> apply["mod_matrix_apply_cv"]
-  apply --> clamp["mod_clamp_u16"]
-  apply --> levelRaw["write_level_pwm_raw"]
-  levelRaw --> scale["scale_level_cv_to_wrap LUT"]
-  updateCV --> cvRaw["write_cv_pwm_raw"]
+  loop0["loop() — Core 0"] --> guard{"A. calibrationFlag ||<br/>manualCalibrationFlag?"}
+  guard -->|yes| clear["mod_matrix_clear_voice(i) ×4<br/>zero all matrix deltas<br/>EARLY RETURN"]
+  guard -->|no| ingest["B. Ingest — fill ModSources"]
+  ingest --> matrix["C. mod_matrix_accumulate_all(&sources, NUM_VOICES_TOTAL)"]
+  matrix --> deltas["D. Extract per-voice deltas<br/>templated getters + __dmb()"]
+  deltas --> lfo["E. LFO speed commit (rate-limited)"]
 ```
 
-`mod_matrix_accumulate` also publishes `matrix_pitch_mod_q24` for the voice pitch path (not a CV PWM write).
-
----
-
-## 1. Call site — [`../DCO.ino`](../DCO.ino)
+### A. Calibration guard — *before* the bench macros
 
 ```cpp
-        BENCH_BEGIN(loop1_cv_outs);
-        update_CV_outs();
-        BENCH_END(loop1_cv_outs);
+if (__builtin_expect(manualCalibrationFlag || calibrationFlag, 0)) {
+    for (uint8_t i = 0; i < NUM_VOICES_TOTAL; i++) {
+        mod_matrix_clear_voice(i);
+        // zero matrix_pitch_mod_*, osc1/osc2 pitch, pw, xmod
+    }
+    return;
+}
 ```
 
-Bench banner prints `cv=FLOAT|FIXED` from `USE_FLOAT_CV_OUTS`. Manual calibration runs `update_CV_outs_manual_calibration()` instead (wide-open filter, muted mix except cal stage).
+The guard is deliberately **above** `BENCH_BEGIN` so a calibration frame cannot produce a corrupt
+probe span. Every per-voice matrix delta is zeroed, so a moving CV cannot corrupt a gap
+measurement.
+
+### B. Ingest — build `ModSources`
+
+Global taps, once:
+
+| Field | Source |
+|---|---|
+| `lfo1` / `lfo2` / `lfo3` | `LFO1Level` / `LFO2Level` / `LFO3Level` (Q15) |
+| `noise` | `noiseLevel[0]` |
+| `pitch_bend` | `midi_pitch_bend − 8192` |
+| `drift_global` | `LFO_DRIFT_LEVEL[0]` |
+| `expression` | `expression_q15` (CC 11) |
+| `breath` | `breath_q15` (CC 2) |
+
+Then a `#pragma GCC unroll 4` loop for the per-voice taps:
+
+| Field | Source | Note |
+|---|---|---|
+| `drift_voice[i]` | `LFO_DRIFT_LEVEL[i*2]` | Osc A of the pair |
+| `env_vca[i]` | `ADSR_VCA_Level_q15[i]` | |
+| `env_dco[i]` | `ADSR3Level_q15[i]` | |
+| `env_vcf[i]` | `ADSR_VCF_Level_q15[i]` | |
+| `velocity[i]` | `velocity[i]` | |
+| `keytrack_note[i]` | `VOICE_NOTES[i] ? … : 60` | Idle voice falls back to note 60 |
+
+Probe: `cv_ingest`. Everything is integer Q15 here regardless of engine.
+
+### C. Accumulate
+
+```cpp
+mod_matrix_accumulate_all(&sources, NUM_VOICES_TOTAL);
+```
+
+One call evaluates all eight slots for all four voices. Probe: `cv_matrix`.
+See [`MOD_MATRIX.md`](MOD_MATRIX.md).
+
+### D. Extract deltas — the float / fixed split
+
+```cpp
+#if defined(USE_FLOAT_VOICE_TASK)
+  matrix_pitch_mod_f[i]      = mod_matrix_get_dest_float<DEST_PITCH>(i);
+  matrix_osc1_pitch_mod_f[i] = mod_matrix_get_dest_float<DEST_OSC1_PITCH>(i);
+  matrix_osc2_pitch_mod_f[i] = mod_matrix_get_dest_float<DEST_OSC2_PITCH>(i);
+#else
+  matrix_pitch_mod_q24[i]      = mod_matrix_get_dest_fast<DEST_PITCH>(i);
+  matrix_osc1_pitch_mod_q24[i] = mod_matrix_get_dest_fast<DEST_OSC1_PITCH>(i);
+  matrix_osc2_pitch_mod_q24[i] = mod_matrix_get_dest_fast<DEST_OSC2_PITCH>(i);
+#endif
+  matrix_pw_mod[i]   = mod_matrix_get_dest_fast<DEST_PW>(i);
+  matrix_xmod_mod[i] = mod_matrix_get_dest_fast<DEST_CROSSMOD_DEPTH>(i);
+__dmb();
+```
+
+The getters are **templates on the destination id**, so the offset is a compile-time constant.
+`..._float` yields octaves (`1.0f` = 1 oct); `..._fast` yields Q24. PW and crossmod always take
+the integer getter.
+
+**The `__dmb()` is load-bearing** — it guarantees Core 1's voice task sees a complete set of
+deltas rather than a half-written mix. Do not drop it when refactoring. Probe: `cv_deltas`.
+
+### E. LFO speed commit
+
+```cpp
+static constexpr uint32_t LFO_DEST_SLEW_US = 201u;
+```
+
+`lfo_commit_speed_if_changed()` reprograms an LFO only when its matrix destination
+(`DEST_LFO1/2/3_SPEED`) **or** its panel speed value changed:
+
+- **Panel speed change → commits immediately.**
+- **Destination-only change → rate-limited to one commit per 201 µs**, shared across all three
+  LFOs via a single `last_dest_flush_us`.
+
+This exists because `setMode0Freq()` is comparatively expensive and a matrix-driven rate sweep
+would otherwise call it every iteration. Frequency comes from
+`fast_exp_speed_5000(speed + dest)`. Probe: `cv_lfo_subloop`.
 
 ---
 
-## 2. Hot path — [`../cv_out.ino`](../cv_out.ino)
+## 3. What this function no longer does
 
-- File roles: helpers + 1 ms block + per-tick VCA/VCF combine + matrix apply + optional `write_cv_pwm_raw`
-- Mod depth bakers / peak math / when to call: **[`CV_MOD_SCALES.md`](CV_MOD_SCALES.md)**
-- Live identities: [§ Hot-path math](#hot-path-math-fixed--shipping) below
-- Fixed path keeps `matrix_cutoff` as `int32_t` through the VCF sum (no float promote)
+`VCA_PWM[]`, `VCF_PWM[]`, `RESONANCE_PWM[]` and `AS2164_VCA_linearize_table[4096]` are still
+**declared** in `cv_out.ino` (as `SRAM_DATA`), and the table is still generated by
+`generateBezierArray(...)` in `init_cv_out()`. But **nothing in `update_CV_outs()` computes or
+writes them any more.**
 
----
+On this instrument the STM32 Mainboard owns VCA, VCF, resonance and the mixer DACs. The DCO
+sends it envelope and filter **blocks** (`'a'`–`'d'`) and parameter frames; the Mainboard runs
+its own combine and drives the analog.
 
-## Hot-path math (fixed / shipping)
+So the formulas the previous revision documented — resonance→VCA compensation, the keytrack
+per-voice Q15 table, `VCA_Calculated`, the dual-filter `combined0/1` sum, the
+`4095 − clamp_u12(...)` cutoff inversion — describe **the Mainboard's job**, or the DCO3
+single-board build. They are not in this file's hot path.
 
-Identities match the `#else` path in [`cv_out.ino`](../cv_out.ino) (`USE_FLOAT_CV_OUTS` off). Q15 multiply: `(a * b) >> 15`. Clamp: `cv_clamp_u12` → 0..4095 (`CV_U12_MAX`). Divisors use `CV_U12_SCALE=4096` (`>>12` / Q15→u12).
-
-### Helpers
-
-```text
-lerp_0_4095(x, y0, y1) = y0 + ((y1 - y0) * x) >> 12
-                         // x in 0..4095; divide by 4096 not 4095
-```
-
-### 1 ms block (`timer1msFlag`)
-
-**Resonance → VCA compensation** (`RESONANCEAmpCompensation`):
-
-```text
-DEFAULT_COMP = 100
-MIN_RESO = 50, MAX_RESO = 2300, MAX_COMP = 315
-
-if disabled:
-  VCAResonanceCompensation = DEFAULT_COMP
-else:
-  reso = min(RESONANCE, MAX_RESO)
-  if reso < MIN_RESO:
-    VCAResonanceCompensation = MAX_COMP
-  else:
-    // ≈ * 0.14f
-    VCAResonanceCompensation = MAX_COMP - (((reso - MIN_RESO) * 36) >> 8)
-```
-
-**Keytrack** (per voice):
-
-```text
-if VCFKeytrack == 0:
-  VCFKeytrackPerVoice_q15[i] = 32768          // ×1.0
-else:
-  dn = VOICE_NOTES[i] - 60                    // was map(note,0,150,-60,90)
-  VCFKeytrackPerVoice_q15[i] = 32768 + VCFKeytrackModifier_q15 * dn
-```
-
-**Drift** (monosynth: osc-0 LFO only, copied to all voices):
-
-```text
-vcf_drift_scale_q15 = analogDrift   // set at boot / drift-amount param
-if analogDrift != 0:
-  VCF_DRIFT[i] = (LFO_DRIFT_LEVEL[0] * vcf_drift_scale_q15) >> 15
-else:
-  VCF_DRIFT[i] = 0
-```
-
-### Per-tick modulation terms
-
-Depth scales baked on knob/CC write — see [`CV_MOD_SCALES.md`](CV_MOD_SCALES.md).
-
-```text
-LFO1_mod   = (LFO1Level * LFO1toVCA_scale_q15) >> 15
-LFO2_mod   = (LFO2Level * LFO2toVCF_scale_q15) >> 15
-ADSR_mod   = (ADSR_VCF_Level_q15  * ADSR2toVCF_scale_q15) >> 15   // filter 0
-ADSR2_mod  = (ADSR_VCF2_Level_q15 * ADSR2toVCF_scale_q15) >> 15   // filter 1
-matrix_cutoff = mod_sums[MOD_DEST_VCF_CUTOFF]   // from accumulate
-```
-
-**Domain note:** EnvVCA silent-gate uses **`ADSR_VCA_Level_q15`**. Export to u12 is `(q15 * 4096) >> 15` (`CV_U12_SCALE`, ≡ `q15 >> 3`) then LFO1 (CV-scaled) is added. Clamps stay **`CV_U12_MAX = 4095`**. EnvVCF uses Q15 taps. DCO ships `ADSR_BEZIER_NATIVE_Q15=1`.
-
-### VCA (each voice)
-
-```text
-if ADSR_VCA_Level_q15[i] == 0:
-  LFO1_current = 0                    // mute LFO into VCA when env idle
-else:
-  LFO1_current = LFO1_mod
-
-env_u12 = (ADSR_VCA_Level_q15[i] * CV_U12_SCALE) >> 15   // SCALE=4096
-vca_pre = env_u12 + LFO1_current
-
-if velocityToVCAVal == 0:
-  vca_vel_q15 = 32768
-else:
-  vca_vel_q15 = max(0, 32768 - velocityToVCA_q15 * (127 - velocity[i]))
-
-VCA_Calculated = clamp_u12( (vca_pre * vca_vel_q15) >> 15 )
-
-VCA_PWM[i] = lerp_0_4095(
-               AS2164_VCA_linearize_table[VCA_Calculated],
-               VCAResonanceCompensation,
-               4095 - VCALevel )
-```
-
-### VCF (dual filters; computed when `i == 0`)
-
-```text
-if velocityToVCFVal == 0:
-  vcf_vel_q15 = 32768
-else:
-  vcf_vel_q15 = max(0, 32768 - velocityToVCF_q15 * (127 - velocity[0]))
-
-combined0 = ADSR_mod  + LFO2_mod + CUTOFF + VCF_DRIFT[0] + matrix_cutoff
-combined1 = ADSR2_mod + LFO2_mod + CUTOFF + VCF_DRIFT[0] + matrix_cutoff
-
-scaled0 = (combined0 * vcf_vel_q15) >> 15
-scaled0 = (scaled0 * VCFKeytrackPerVoice_q15[0]) >> 15
-scaled1 = (combined1 * vcf_vel_q15) >> 15
-scaled1 = (scaled1 * VCFKeytrackPerVoice_q15[0]) >> 15
-
-VCF_PWM[0] = 4095 - clamp_u12(scaled0)   // inverted soft cutoff CV
-VCF_PWM[1] = 4095 - clamp_u12(scaled1)
-```
-
-Filter 0 uses EnvVCF; filter 1 uses EnvVCF2. Same LFO2, CUTOFF, drift, and matrix cutoff on both.
-
-### Side effects / branches
-
-- **Pitch:** `mod_matrix_accumulate` → `matrix_pitch_mod_q24 = mod_matrix_pitch_to_q24(dest_pitch)` for the voice engine.
-- **Cal:** if `manualCalibrationFlag`, matrix sums and pitch mod are zeroed here; PWM writers use `update_CV_outs_manual_calibration` on the cal branch instead of this function’s normal path.
-- **Dist / levels / reso PWM:** `mod_matrix_apply_cv` (unless cal) then optional `write_cv_pwm_raw` under `ENABLE_CV_OUTS`. Soft math still runs when HW PWM is off.
-
-### Float A/B (`USE_FLOAT_CV_OUTS`)
-
-Same structure: Env + LFO + CUTOFF + drift + matrix, then × velocity × keytrack. Differences: float scales/factors; EnvVCF still **u12** × `ADSR2toVCF_scale`; keytrack `1 + modifier*(note-60)`; drift `LFO_DRIFT_LEVEL[0] * analogDrift / 32767`. Not the shipping path.
+`ENABLE_CV_OUTS` (**off**) still gates the writers in [`PWM.ino`](../PWM.ino) for a future
+expansion where the DCO drives that analog directly; see [`PINOUT.md`](PINOUT.md) for why the
+draft pins collide with the 8-oscillator RESET/RANGE map.
 
 ---
 
-## 3. Matrix — [`../mod_matrix.h`](../mod_matrix.h) / [`../mod_matrix.ino`](../mod_matrix.ino)
+## 4. Manual calibration path
 
-- Sources as **Q15** via `mod_matrix_read_source_q15`
-- Accumulate: `(src_q15 * depth) >> 15` into `dest_sums[]` (`memset` zero)
-- Noise: pass-through `noiseLevel[i]` for `MOD_SRC_NOISE0` / `NOISE1` only
-- Fleet is two gens ([`../noise.h`](../noise.h): `NUM_NOISE_GENS == 2`). `MOD_SRC_NOISE2` / `NOISE3` (IDs 14/15) stay reserved for panel/protocol stability and read as **0**
-- VOICE-AUX mirrors Q15 random + accumulate for dist apply
-- Deep reference: [`MOD_MATRIX.md`](MOD_MATRIX.md)
+```cpp
+void update_CV_outs_manual_calibration() {
+#ifndef ENABLE_CV_OUTS
+  byte stage = (byte)manualCalibrationStage;
+  waveSelector_manual_calibration(stage);
+#endif
+}
+```
 
----
-
-## 4. PWM writers — [`../PWM.ino`](../PWM.ino) (`ENABLE_CV_OUTS`)
-
-- `level_wrap_for_slice[8]` filled in `init_level_pwm()`
-- `scale_level_cv_to_wrap` — O(1) lookup; still `/ DIV_COUNTER_CV` when scaling shared wraps
-- `write_level_pwm_raw` / `write_cv_pwm_raw` — gated by `ENABLE_CV_OUTS` (soft CV math still runs when off)
+With `ENABLE_CV_OUTS` off — the shipping case — it only drives the wave selector for the current
+calibration stage. It does **not** open the filter or mute the mix, because this board does not
+own those CVs.
 
 ---
 
-## 5. Soft CV state — [`../cv_state.h`](../cv_state.h)
+## 5. Baked scales and helpers
 
-Under `USE_FLOAT_CV_OUTS`: float `*_scale`, `VCFKeytrackModifier` / `VCFKeytrackPerVoice[]`, `velocityToVCA/VCF`, `float VCF_DRIFT[]`.
+Still live in `cv_out.ino`:
 
-Else: `*_scale_q15`, `VCFKeytrackPerVoice_q15[]`, `velocityTo*_q15`, `vcf_drift_scale_q15`, `int16_t VCF_DRIFT[]`.
+| Helper | Role |
+|---|---|
+| `cv_bake_adsr2_to_vcf_scale()` | Bake EnvVCF→cutoff depth on write |
+| `cv_bake_lfo2_to_vcf_scale()` | Bake LFO2→cutoff depth |
+| `cv_bake_lfo1_to_vca_scale()` | Bake LFO1→VCA depth |
+| `cv_update_mod_scales()` | Recompute all of the above |
+| `cv_q15_to_u12(q15)` | `(q15 * CV_U12_SCALE) >> 15`, `CV_U12_SCALE = 4096` |
+| `cv_clamp_u12(v)` | Clamp to `CV_U12_MAX = 4095` |
+| `lerp_0_4095(x, y0, y1)` | `y0 + ((y1 − y0) * x) >> 12` — divide by 4096, not 4095 |
+| `init_cv_out()` | Zero state, build `AS2164_VCA_linearize_table` via `generateBezierArray` |
+
+The bakers are called from the `'d'` filter-block handler and the relevant `apply_param_*`
+setters — **bake on write**, never per tick. Details and the peak math:
+[`CV_MOD_SCALES.md`](CV_MOD_SCALES.md).
+
+---
+
+## 6. Bench probes in this path
+
+| Probe | Covers |
+|---|---|
+| `loop0_cv_outs` | The whole call |
+| `cv_ingest` | Stage B |
+| `cv_matrix` | Stage C |
+| `cv_deltas` | Stage D |
+| `cv_lfo_subloop` | Stage E |
+
+All are inside the calibration guard, so a calibration frame contributes no samples.
+Reading rules: [`BENCHMARKING.md`](BENCHMARKING.md) — and note that the running-average profiler
+is currently not compiled (SWD telemetry is active instead).
+
+---
+
+## 7. What changed
+
+| Topic | Previous revision | Current |
+|---|---|---|
+| Call site | `loop1()` / Core 1 | **`loop()` / Core 0**, every iteration |
+| Rate | "~10 kHz with ADSR" | Every Core 0 iteration |
+| Bench probe | `loop1_cv_outs` | **`loop0_cv_outs`** + 4 stage probes |
+| Structure | Helpers + 1 ms block + per-tick combine + matrix apply | **5 stages**: guard → ingest → accumulate → extract → LFO commit |
+| VCA / VCF / reso CVs | Computed and written here | **Not computed here** — Mainboard owns that analog |
+| Matrix entry | `mod_matrix_accumulate()` + `mod_matrix_apply_cv()` | `mod_matrix_accumulate_all()` + templated getters |
+| Source read | `mod_matrix_read_source_q15()` | `ModSources` struct filled in stage B |
+| Sum scope | Global / mono | **Per voice** |
+| Pitch latch | `dest_sums[MOD_DEST_VCF_CUTOFF]`, `matrix_pitch_mod_q24` scalar | `matrix_pitch_mod_f[]` / `_q24[]` **arrays**, plus per-osc and PW/xmod deltas |
+| `USE_FLOAT_CV_OUTS` | "default off on both MCUs" | **On for RP2350**, off for RP2040 |
+| Memory barrier | not present | **`__dmb()`** after the extract loop |
+| LFO rate commit | not present | `lfo_commit_speed_if_changed()`, 201 µs slew on dest-only changes |
+| Noise sources | `MOD_SRC_NOISE0/1`, two gens, 2/3 reserved | Single `SRC_NOISE` (id 15) |
+| `mod_matrix.ino` | referenced | **Does not exist** — engine is `_shared/mod_matrix_engine.h` |
+
+---
+
+## 8. Code map
+
+| File | Role |
+|------|------|
+| [`cv_out.ino`](../cv_out.ino) | The pipeline, bakers, `init_cv_out()`, `AS2164_VCA_linearize_table` |
+| [`cv_state.h`](../cv_state.h) | Soft CV state; float `*_scale` under `USE_FLOAT_CV_OUTS`, else `*_scale_q15` |
+| [`cv_bezier.h`](../cv_bezier.h) | `generateBezierArray` for the VCA linearisation table |
+| [`_shared/mod_matrix_engine.h`](../_shared/mod_matrix_engine.h) | `ModSources`, MAC core, templated getters |
+| [`mod_matrix.h`](../mod_matrix.h) | Board glue |
+| [`PWM.ino`](../PWM.ino) | `write_cv_pwm_raw` / `write_level_pwm_raw`, gated by `ENABLE_CV_OUTS` (**off**) |
+| [`voices.ino`](../voices.ino) / [`voice_task_backup.ino`](../voice_task_backup.ino) | Consume the `matrix_*` deltas in the pitch sum |
+| [`LFO.ino`](../LFO.ino) | `LFO1Level` / `LFO2Level` / `LFO3Level` / `LFO_DRIFT_LEVEL[]` |

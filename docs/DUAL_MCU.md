@@ -1,128 +1,232 @@
-# Dual MCU voice path (RP2350A + RP2040)
+# Dual MCU voice path (RP2350 + RP2040 aux)
 
-**Status:** architecture + firmware scaffold. Helper sketch: [`../../VOICE-AUX/`](../../VOICE-AUX/). Input remains the source of truth for **live** parameter values; presets belong to the DCO ([`PRESET_STORE.md`](PRESET_STORE.md)).
+**Status: architecture + firmware scaffold.** Helper sketch:
+[`../../VOICE-AUX/`](../../VOICE-AUX/).
 
-Related: [`SYSTEM_OVERVIEW.md`](SYSTEM_OVERVIEW.md), [`PINOUT.md`](PINOUT.md), [`FILTER_ROUTING.md`](FILTER_ROUTING.md), [`DISTORTION.md`](DISTORTION.md), [`../../VOICE-AUX/docs/README.md`](../../VOICE-AUX/docs/README.md).
+> 🔴 **Rewritten 2026-09-16.** Two classes of error: the ParamIds were all wrong (Dist **58/59**
+> not 52/53, filter mode **60** not 54, matrix slots **63–86** not 60–83, and 55–56 are EnvDCO
+> curves, not reserved for FX), and the **link topology no longer matches this instrument** —
+> the DCO has no direct Input UART to fan out. See [§8](#8-what-changed).
+
+Related: [`SYSTEM_OVERVIEW.md`](SYSTEM_OVERVIEW.md), [`PINOUT.md`](PINOUT.md),
+[`FILTER_ROUTING.md`](FILTER_ROUTING.md), [`DISTORTION.md`](DISTORTION.md),
+[`../../VOICE-AUX/docs/README.md`](../../VOICE-AUX/docs/README.md).
 
 ---
 
-## Why
+## 1. Why
 
-GPIO / PWM headroom without mandating an **RP2350B**. Production voice path:
+GPIO / PWM headroom without mandating an **RP2350B**. With 8 oscillators the DCO's pin budget is
+effectively exhausted ([`PINOUT.md`](PINOUT.md)): every draft CV pin collides with a RESET or
+RANGE line, and only **GP6** is genuinely free.
 
 | MCU | Role |
 |-----|------|
-| **RP2350A** | DCO board: oscillators, osc switching/levels, Input hub, filter **cutoff/reso** CV, main **VCA** CV |
-| **RP2040** | Post-filter controls: AS3320 mode, distortion Drive/Mix, effects, other filter→output digitals/PWMs **except** Cut/Res/VCA |
+| **RP2350 (DCO)** | Oscillators, osc switching / levels, MIDI, Mainboard link, filter **cutoff/reso** CV, main **VCA** CV |
+| **RP2040 (aux)** | Post-filter controls: AS3320 mode, distortion Drive/Mix, effects — everything after the filter **except** Cut/Res/VCA |
 
-**Alternate:** a single **RP2350B** can still run the **full** stack alone (no helper). The `DCO/` firmware must **keep** code paths for everything the RP2040 would own, so that build stays viable.
+**Alternate:** a single **RP2350B** can run the full stack alone. The `DCO6/` firmware must
+**keep** code paths for everything the aux would own so that build stays viable.
+
+> On this instrument the **STM32 Mainboard already owns VCA/VCF/resonance analog**
+> ([`UPDATE_CV_OUTS_HOT_PATH.md`](UPDATE_CV_OUTS_HOT_PATH.md)). The "critical CVs" column above
+> describes the solo-board configuration where `ENABLE_CV_OUTS` is on — it is **off** in the
+> shipping tree. Settle who owns what before building the aux.
 
 ---
 
-## Parameter authority
+## 2. ⚠️ The link topology has changed
 
-- **Source of truth:** Input Controller for live panel values, same as today; preset storage is the DCO's ([`PRESET_STORE.md`](PRESET_STORE.md)).
-- Both MCUs **RX** the Input→voice UART (fan out Input TX to RP2350A RX and RP2040 RX).
-- Each board applies only **its owned** ParamIds / blocks and **discards** the rest.
-- **Nothing upstream from the RP2040** — it never drives the Input bus.
-- Only the **RP2350A** TX back to Input (gap `'x'` 154, cal 155, etc.).
+The original design assumed the DCO sat directly on the Input bus, so the aux could be added by
+**fanning out Input TX** to a second RX pin.
 
-No spare HW UART on the DCO RP2350 for a 2350→2040 command link; dual-listen + discard is intentional.
+**That wire no longer exists.** On the classic DCO4 wiring the DCO's only peer UART is the STM32
+Mainboard:
+
+```
+Input <--Serial8--> Mainboard <--Serial2--> DCO <--USB CDC--> host
+```
+
+Panel traffic reaches the DCO **relayed**, already filtered by the Mainboard's relay tables.
+So a fan-out has to tap one of the links that actually exist:
+
+| Option | Tap | Notes |
+|---|---|---|
+| **A** | Input TX → Mainboard `Serial8`, fan out to aux RX | Aux sees raw panel frames, same as the original plan. Needs a stub at the Input end |
+| **B** | Mainboard TX → DCO `Serial2` (GP21), fan out to aux RX | Aux sees only what the Mainboard **chose to relay** — a command absent from `mainSerial2Commands[]` never arrives |
+| **C** | Mainboard gains a dedicated aux link | Cleanest, costs a UART on the STM32 |
+
+**Option B is the trap.** Dist/mode ParamIds arrive as `'p'` frames, and the Mainboard applies
+`'p'` through its own `paramTable[]` and re-emits DCO-owned ids with `forward_dco()` — so an id
+the Mainboard does not know about is **not forwarded at all**. Any aux hanging off Serial2 needs
+those ids added to the Mainboard's forward table first.
 
 ```mermaid
 flowchart LR
-  Input["Input_Controller"] -->|"TX panel stream 2.5M"| Bus["Input_TX_fanout"]
-  Bus --> DCO["RP2350A_DCO_RX"]
-  Bus --> Aux["RP2040_aux_RX"]
-  DCO -->|"TX gap/cal only"| Input
-  DCO --> Osc["Osc_wave_level"]
-  DCO --> CritCV["Cut_Res_VCA_PWM"]
-  Aux --> Post["Mode_Dist_FX"]
+  Input["Input Controller"] -->|"Serial2 GP4/5"| MB["STM32 Mainboard"]
+  MB -->|"Serial2 relay"| DCO["RP2350 DCO"]
+  MB -.->|"option A/B fan-out"| Aux["RP2040 aux"]
+  DCO -->|"'x' 154/155 upstream"| MB
+  DCO --> Osc["Osc / wave / level"]
+  Aux --> Post["Mode / Dist / FX"]
 ```
 
-Boot gap: prefer Input **periodic full snapshot** (or resend on demand) so a late-powered RP2040 catches up. Do not rely on the RP2350 mirroring params to the RP2040.
+**Nothing upstream from the aux** — it never drives a bus. Only the DCO transmits upstream
+(`'x'` 154 gap, 155 cal offset).
+
+**Boot gap:** prefer a **periodic full snapshot** from Input (or resend on demand) so a
+late-powered aux catches up. Do not rely on the DCO mirroring params to it.
 
 ---
 
-## Ownership split
+## 3. Ownership split
 
-### RP2350A (`DCO/` project) — always
+### RP2350 DCO (`DCO6/`) — always
 
 | Domain | Examples |
 |--------|----------|
-| Oscillators | PIO DCO, sync, cal, RESET/RANGE/PW |
-| Osc switching | Dual 74HC595 → 3× DG411 (OSC1–3 Saw/Pulse/Tri) — [`WAVE_MUX.md`](WAVE_MUX.md) |
-| Osc levels | OSC1/2/3 + Sub PWM → level VCAs |
-| Critical CVs | Filter **cutoff** ×2, **resonance** ×2, main **VCA** |
-| Hub | Input UART RX + TX upstream; MIDI as today |
-| Envelopes / LFOs | EnvDCO/VCA/VCF state that drives those CVs |
+| Oscillators | PIO DCO, sync, calibration, RESET / RANGE / PW |
+| Osc switching | Dual 74HC595 → 3× DG411 ([`WAVE_MUX.md`](WAVE_MUX.md)) — `ENABLE_WAVE_MUX` off |
+| Osc levels | OSC1/2 + Sub PWM → level VCAs |
+| Critical CVs | Filter cutoff ×2, resonance ×2, main VCA — **only when `ENABLE_CV_OUTS` is on** |
+| Links | Mainboard `Serial2`; MIDI USB + DIN |
+| Envelopes / LFOs / matrix | Full state, on Core 0 |
+| Presets | The instrument's only 256-slot store ([`PRESET_STORE.md`](PRESET_STORE.md)) |
 
-### RP2040 (new helper project — TBD) — dual-MCU build
-
-Everything from the **filter through the end of the chain** that is **not** cutoff, resonance, or VCA CV:
+### RP2040 aux — dual-MCU build
 
 | Domain | Examples |
 |--------|----------|
 | Filter mode | AS3320 multimode GPIOs → DG411/4066 ([`FILTER_ROUTING.md`](FILTER_ROUTING.md)) |
-| Distortion | Drive / Mix PWM (+ related digitals) ([`DISTORTION.md`](DISTORTION.md)) |
+| Distortion | Drive / Mix PWM ([`DISTORTION.md`](DISTORTION.md)) |
 | Effects | FV-1 program / digitals (later) |
-| I2S listen | PCM5102 noise listen (local gens @ 48 kHz) — [`VOICE-AUX/docs/I2S_NOISE.md`](../../VOICE-AUX/docs/I2S_NOISE.md); **not** on DCO |
-| Other | Post-filter switches, mutes, slow controls in that segment |
+| I2S listen | PCM5102 noise listen — [`VOICE-AUX/docs/I2S_NOISE.md`](../../VOICE-AUX/docs/I2S_NOISE.md); **not** on the DCO |
+| Other | Post-filter switches, mutes, slow controls |
 
-### Discard matrix (dual-MCU)
+---
 
-| Param class from Input | RP2350A | RP2040 |
-|------------------------|---------|--------|
-| Notes, osc, wave, level, ADSR, LFO→voice | Apply | Discard |
+## 4. Live ParamId ownership
+
+| Domain | IDs | Dual-MCU owner |
+|--------|-----|----------------|
+| Osc / wave / level / notes / ADSR / LFO | `'a'`–`'d'`, `'p'`, mux, level PWM | **DCO** |
+| Cut / Res / VCA | `'d'`, envelopes, `PARAM_VCA_LEVEL` **43** | **DCO** (or Mainboard — see §1) |
+| Dist Drive / Mix | `PARAM_DIST_DRIVE` **58**, `PARAM_DIST_MIX` **59** | **aux** |
+| AS3320 mode | `PARAM_FILTER_MODE` **60** | **aux** |
+| Mod matrix slots | ParamIds **63–86** (8 slots × source/dest/depth) | **both** — see below |
+| Upstream `'x'` 154 / 155 | DCO TX only | **DCO** |
+
+> ❌ **There is no FX id reservation at 55–56.** Those are `PARAM_ADSR3_DECAY_CURVE` and
+> `PARAM_ADSR3_RELEASE_CURVE`. Free ranges for future FX: **5–6, 61–62, 103–119, 138–149,
+> 163–169, 175–189, 195–198, 202–209, 213, 238+**
+> ([`PARAMETER_ROUTING.md`](../../DCO-PROTOCOL/docs/PARAMETER_ROUTING.md)).
+
+### Matrix destination split
+
+The `ModDest` enum was renumbered, so the old "dest 6 = Dist Drive" rule is wrong:
+
+| Dest | Name | Owner |
+|---:|---|---|
+| **5** | `DEST_DIST_DRIVE` | aux |
+| **6** | `DEST_DIST_MIX` | aux |
+| 0–4, 7–33 | Pitch, cutoff, levels, VCA, reso, env scalers, LFO rates, PW, crossmod, … | DCO |
+
+Both boards run the same matrix engine and apply only their own destinations.
+
+⚠️ **The DCO matrix is per voice** (`mod_matrix_accumulate_all(&sources, NUM_VOICES_TOTAL)`),
+but distortion is a **single post-mix stage**. The aux has to decide how four per-voice
+`DEST_DIST_DRIVE` sums collapse into one CV — sum, max, or voice 0 only. That is an open design
+question, not a detail ([`MOD_MATRIX.md`](MOD_MATRIX.md)).
+
+### Discard matrix
+
+| Param class | DCO | aux |
+|---|---|---|
+| Notes, osc, wave, level, ADSR, LFO | Apply | Discard |
 | Cutoff, resonance, VCA | Apply | Discard |
-| Mod matrix 60–83 (dests 0–5) | Apply | Discard (dest≠6) |
-| Mod matrix 60–83 (dest 6 Dist Drive) | Apply (solo) / soft base | Apply |
-| Dist Drive/Mix, AS3320 mode, FX, other post-filter | Discard* | Apply |
+| Matrix slots, dests 0–4 / 7–33 | Apply | Discard |
+| Matrix slots, dests 5–6 (Dist) | Soft base only | **Apply** |
+| Dist Drive/Mix, filter mode, FX | Discard* | **Apply** |
 
-\*On the dual-MCU hardware build, the RP2350A must **not** also drive those pins (avoid fighting the RP2040). Flag: **`ENABLE_VOICE_AUX`** in [`../DCO.ino`](../DCO.ino) — skip Dist PWM init/writes; keep `apply_param_dist_*` / `PARAM_FILTER_MODE` state updates.
+\* On dual-MCU hardware the DCO must **not** drive those pins. `ENABLE_VOICE_AUX` skips the Dist
+PWM init/writes while keeping the state updates.
 
-### Live ParamId ownership
-
-| Domain | Mechanism / IDs | Dual-MCU owner |
-|--------|-----------------|----------------|
-| Osc / wave / level / notes / ADSR / LFO→voice | `'a'`–`'d'`, `'p'`, mux, level PWM | **RP2350** |
-| Cut / Res (+ `'d'` mods), VCA | `'d'`, envs, `PARAM_VCA_LEVEL` 43, … | **RP2350** |
-| Dist Drive / Mix | `PARAM_DIST_DRIVE` **52**, `PARAM_DIST_MIX` **53** | **RP2040** ([`VOICE-AUX/`](../../VOICE-AUX/)) |
-| AS3320 mode | `PARAM_FILTER_MODE` **54** | **RP2040** |
-| Mod matrix slots | ParamIds **60–83** — DCO applies dests 0–5; aux applies dest 6 (Dist Drive) | **both** (see [`MOD_MATRIX.md`](MOD_MATRIX.md)) |
-| FX (reserved) | **55–56** commented in `params_def.h` | **RP2040** later |
-| Upstream `'x'` 154/155 | DCO TX only | **RP2350** |
-
-Aux parses `'p'` only for apply; `'a'`–`'d'` / `'q'` are discarded after framing.
+The aux parses `'p'` only; `'a'`–`'d'` / `'q'` are discarded after framing.
 
 ---
 
-## DCO firmware policy: keep full functionality
+## 5. `ENABLE_VOICE_AUX` — what it actually does today
 
-The `DCO/` tree on RP2350 retains **complete** support for Dist Drive/Mix writers and `PARAM_FILTER_MODE` apply state so an **RP2350B-only** build can own the whole voice path again.
+**The flag is off**, and in [`globals.h`](../globals.h) it currently has exactly one effect:
 
-| Build | Behavior |
-|-------|----------|
-| **Dual MCU** (`ENABLE_VOICE_AUX`) | DCO applies osc + Cut/Res/VCA; Dist/mode **state** still updates; **no** Dist pin drive |
-| **Single MCU** (flag off) | DCO applies **all**; Dist on GP9/GP26 under `ENABLE_CV_OUTS` |
+```c
+#ifdef ENABLE_VOICE_AUX
+static constexpr uint8_t OSC3_LEVEL_PIN = 9;   // Dist Drive pin freed on DCO
+static constexpr uint8_t SUB_LEVEL_PIN  = 26;  // Dist Mix pin; slice 5 w/ VCA
+#else
+static constexpr uint8_t OSC3_LEVEL_PIN = 32;  // RP2350B provisional
+static constexpr uint8_t SUB_LEVEL_PIN  = 33;
+#endif
+```
 
-Do **not** strip dist/mode logic from `DCO/` — gate writers only.
+It **reassigns GP9 and GP26** — the distortion pins — to OSC3 and Sub level, on the assumption
+the aux has taken distortion over. Without the flag those levels sit on GP32/GP33, which only
+exist on an **RP2350B**.
+
+> There is **no `apply_param_dist_*` and no `apply_param_filter_mode` in the DCO
+> `paramTable[]`**, so the "keep the state updates, gate only the writers" policy is currently
+> aspirational — there is no state to keep. The ids are reserved end to end and unrouted on this
+> board.
+
+| Build | Behaviour |
+|-------|-----------|
+| **Dual MCU** (`ENABLE_VOICE_AUX`) | GP9/GP26 become OSC3/Sub level; aux owns Dist + mode |
+| **Solo RP2350B** (flag off) | OSC3/Sub level on GP32/33; Dist would need appliers + `ENABLE_CV_OUTS` |
+| **Solo RP2350A/RP2040** (flag off) | GP32/33 do not exist — OSC3/Sub level unavailable |
+
+Do **not** strip dist/mode logic from `DCO6/` — gate writers only, so the RP2350B build stays
+possible.
 
 ---
 
-## Electrical / link notes
+## 6. Electrical / link notes
 
-- Short stubs from Input TX to both RX pins; common ground.
-- RP2040 RX only (`VOICE-AUX` uses `Serial1` GP1); leave UART TX unconnected to the Input bus.
-- Baud / framing identical to today’s DCO←Input link (2.5 M).
-- Aux provisional pins: see [`VOICE-AUX/docs/README.md`](../../VOICE-AUX/docs/README.md) (GP2/3 Dist PWM, GP4/5 mode).
+- Short stubs from the chosen TX to both RX pins; common ground.
+- Aux is **RX only** (`VOICE-AUX` uses `Serial1` GP1); leave its TX unconnected.
+- Baud / framing identical to the rest of the system: **2.5 M**, slim little-endian, `0x00`
+  delimiter, RAW or COBS — **must match** whatever the tapped link uses
+  (`SERIAL_FRAMING_COBS` is off).
+- Aux provisional pins: [`VOICE-AUX/docs/README.md`](../../VOICE-AUX/docs/README.md) — GP2/3
+  Dist PWM, GP4/5 mode.
 
 ---
 
-## Status / follow-ups
+## 7. Status / follow-ups
 
-- [x] ParamIds 52–54 synced across DCO / Input / Screen / VOICE-AUX `params_def.h`
-- [x] `ENABLE_VOICE_AUX` gates DCO Dist PWM
+- [x] `ENABLE_VOICE_AUX` reassigns GP9/GP26 in `globals.h`
 - [x] [`VOICE-AUX/`](../../VOICE-AUX/) RX parse → Dist PWM + mode GPIO stub
-- [ ] Input **full snapshot** on aux boot (cycle controls for v1)
-- [ ] Freeze aux pinout on PCB; wire panel/MIDI for `PARAM_FILTER_MODE`
+- [ ] **Re-sync the aux's `params_def.h`** — it was synced against the old 52/53/54 numbering
+- [ ] **Pick the fan-out tap** (§2). If option B, add the Dist/mode ids to the Mainboard's
+      `forward_dco()` table
+- [ ] Decide how per-voice matrix dest 5/6 collapses to one CV (§4)
+- [ ] Add appliers for 58 / 59 / 60 on the owning board
+- [ ] Input **full snapshot** on aux boot
+- [ ] Freeze the aux pinout on the PCB; wire panel / MIDI for `PARAM_FILTER_MODE` (CC 118 exists)
+
+---
+
+## 8. What changed
+
+| Topic | Previous revision | Current |
+|---|---|---|
+| Dist ParamIds | 52 / 53 | **58 / 59** |
+| Filter mode ParamId | 54 | **60** |
+| Matrix slot ids | 60–83 | **63–86** |
+| Matrix dist dests | 6 / 8 | **5 / 6** |
+| FX reservation | "55–56 commented" | **False** — those are EnvDCO curve ids |
+| Link topology | Input TX fanned out to both MCUs | **No direct DCO↔Input wire** — must tap Input↔MB or MB↔DCO |
+| Flag location | `DCO.ino` | [`settings.h`](../settings.h) |
+| `ENABLE_VOICE_AUX` effect | "skips Dist PWM init/writes" | **Reassigns GP9/GP26**; there are no Dist writers to skip |
+| Dist/mode appliers on DCO | assumed present | **Absent** |
+| Matrix sum scope | global | **per voice** — affects how dist CV is derived |
+| Critical CV owner | DCO | **Mainboard** on this instrument (`ENABLE_CV_OUTS` off) |

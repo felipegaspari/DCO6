@@ -1,17 +1,20 @@
-# DCO PIO Oscillators, Sync and Phase Align
+# DCO6 PIO Oscillators, Sync and Phase Align
 
-How the eight oscillator cores (4 voices × 2 DCOs) are driven from PIO: the resident programs, the state machine
-topology, the period arithmetic, the two sync flavours, phase align, and the sub-oscillator.
+How the eight oscillator cores (4 voices × 2 DCOs) are driven from PIO: the resident programs,
+the state machine topology, the period arithmetic, the two sync flavours, phase align, and the
+sub-oscillator.
 
 **Live source of truth for the programs:** [`pico-dco.pio.h`](../pico-dco.pio.h) — *not* the
-`.pio` source, see section 4.
+`.pio` source, see section 4. The triangle program and its init live in
+[`state_machines.ino`](../state_machines.ino).
 **Live source of truth for the wiring and roles:** [`state_machines.ino`](../state_machines.ino).
 **Live source of truth for the timing constants:** the "PIO Program Timing Constants" block in
 [`globals.h`](../globals.h).
 
-Related: [`PINOUT.md`](PINOUT.md) (pin and block map), [`../_shared/docs/AUTOTUNE.md`](../_shared/docs/AUTOTUNE.md) (how the
-reset pulse interacts with gap measurement and amp-comp), [`ENGINE_OPTIONS.md`](ENGINE_OPTIONS.md)
-(which voice engine computes the dividers).
+Related: [`PINOUT.md`](PINOUT.md) (pin and block map),
+[`../_shared/docs/AUTOTUNE.md`](../_shared/docs/AUTOTUNE.md) (how the reset pulse interacts with
+gap measurement and amp-comp), [`ENGINE_OPTIONS.md`](ENGINE_OPTIONS.md) (which voice engine
+computes the dividers).
 
 ---
 
@@ -42,62 +45,100 @@ Two consequences shape everything below:
 - **The reset pulse is dead time.** It is part of the period but contributes no ramp, so it
   affects waveform shape and amplitude, not just timing (section 2).
 
+### 1.1 Two core types, two programs
+
+**This board runs two different oscillator cores**, dispatched in `start_voice_sms()`:
+
+```cpp
+if (i % 2 != 0) {
+  dco_triangle_init(...);            // OSC B — odd index — triangle core
+} else {
+  frequency_sync_poll_init(...)      // OSC A — even index — saw core (soft-sync slave)
+  or frequency_sync_4_jumps(...);    //                      saw core (free / hard sync)
+}
+```
+
+| | Osc A (even idx) | Osc B (odd idx) |
+|---|---|---|
+| Core | Sawtooth | Triangle |
+| Program | `frequency_sync_4_jumps` / `frequency_sync_poll` | `dco_triangle` |
+| Program length | 20 / 21–23 | **11** |
+| Sideset config | `sm_config_set_sideset(&c, 2, true, false)` | `sm_config_set_sideset(&c, 1, false, false)` |
+| **SET pins configured?** | **Yes** — `sm_config_set_set_pins(&c, pin, 1)` | **No** |
+| Has a PW channel? | Yes (`cal_pw_channel` = `osc/2`) | No |
+| `osc_uses_sync_program[]` | true only for a soft-sync slave | always false |
+
+> 🔴 **The SET-pin asymmetry is a real trap.** `dco_triangle_init()` configures **only** the
+> sideset pins. With the SET pin count left at 0, every `pio_encode_set(pio_pins, x)` aimed at
+> an **odd** oscillator is a **silent no-op**. The same instruction works on even oscillators,
+> because their init does call `sm_config_set_set_pins()`.
+>
+> The core-agnostic way to clamp a pad is `pio_sm_set_pins_with_mask()`, or
+> `pio_sm_exec(pio, sm, pio_encode_nop() | pio_encode_sideset(1, level))` — raw `0xb042` for
+> side 1, `0xa042` for side 0 — with the SM **disabled first**. `gpio_put()` is dead on a pad
+> muxed to PIO.
+
 ---
 
 ## 2. The analog core and where `pioPulseLength` comes from
 
 ```c
-static constexpr uint32_t sysClock_Hz = 225000000;
-uint32_t pioPulseLength = 1600;  // cycles; runtime via PARAM_DEBUG_COMMAND 160 ∈ [200, 50000]
+uint32_t pioPulseLength = 3000;  // cycles; runtime via PARAM_DEBUG_COMMAND 160 ∈ [200, 50000]
 ```
 
 `pioPulseLength` is the reset pulse width in system clock cycles, held in the state machine's
-**Y** register. At 225 MHz, 1600 cycles is **~7.1 us**. It is not persisted; the Calibration
-tab in `dco_control` sends unsigned 16-bit values 200–50000 on id 160 to change it live
-(small opcodes 1–30 stay below that range). Setting Y via debug 160 also requests
-`pio_defer_request_reset_pulse_all()` so running SMs reload (stop / load Y / restart) and
-voices resplit period.
+**Y** register. At 225 MHz, 3000 cycles is **~13.3 µs**. It is not persisted; the Calibration
+tab in `dco_control` sends unsigned 16-bit values 200–50000 on id 160 to change it live (small
+opcodes 1–30 stay below that range). Setting Y via debug 160 also requests
+`pio_defer_request_reset_pulse_all()` so running SMs reload (stop / load Y / restart) and voices
+resplit the period on the next note.
+
+> The system clock is **not** a compile-time constant. `sysClock_Hz` is a macro over
+> `sysClock_Hz_cached`, filled by `sys_clock_hz_refresh()` from `clock_get_hz(clk_sys)` once per
+> core at the top of `setup()` / `setup1()`. Arduino's *Tools → CPU Speed* sets the real value
+> before either runs. Never call `clock_get_hz()` on the voice hot path.
 
 ### 2.1 Sizing the pulse
 
-The pulse has to fully discharge the integrator capacitor, and no longer. From the design
-discussion behind the current analog build:
+The pulse has to fully discharge the integrator capacitor, and no longer:
 
 | Quantity | Value | Why |
 |----------|-------|-----|
 | Integrator cap | 4.7 nF | Chosen with the 20 k range resistor for the target pitch range |
 | Range resistor | 20 k | Sets the charging current per RANGE PWM level |
 | Discharge series R | ~180 R | Limits peak switch current inside the DG411's pulsed rating |
-| Discharge time constant | ~846 ns | `180 R x 4.7 nF` |
-| Pulse needed for full discharge | **~7.5 us (~1700 cycles)** | About 9 time constants; residual charge is negligible |
+| Discharge time constant | ~846 ns | `180 R × 4.7 nF` |
+| Pulse needed for full discharge | **~7.5 µs (~1700 cycles)** | About 9 time constants; residual charge negligible |
 
 **RESET pad polarity.** PIO programs always use logical `1` = assert / discharge and `0` = ramp.
-If the analog switch is **active-low** (DG411: IN low closes the discharge path), define
-`ENABLE_PIO_RESET_INVERT` in [`DCO.ino`](../DCO.ino). `start_voice_sms()` then applies GPIO
-`OUTOVER` + `INOVER` invert on every `RESET_PINS[]` entry so the pad is active-low while
-soft-sync `jmp pin`, hard-sync sideset, phase-align `set pins, 0`, and the sub-oscillator
-`wait` on that voice’s OSC A RESET all keep the same logical sense. Leave the flag undefined for
-active-high / direct FET discharge.
+The analog switch is a **DG411** (IN low closes the discharge path), so
+`ENABLE_PIO_RESET_INVERT` **is defined** in [`settings.h`](../settings.h).
+`start_voice_sms()` then calls `pio_reset_pin_apply_polarity()` on every `RESET_PINS[]` entry,
+applying GPIO `OUTOVER` + `INOVER` invert so the pad is active-low while soft-sync `jmp pin`,
+hard-sync sideset and the sub-oscillator `wait` all keep the same logical sense. Parking an
+inactive oscillator's reset therefore uses logical level **1**.
 
-> **Open item.** The constant is **3000** cycles (13.3 us), roughly 1.8x the ~1700 the RC
-> analysis calls for. See section 13 before changing it — it is not simply a spare-margin
-> decision, because the amp-comp calibration is measured *with* the current pulse width.
+> ⚠️ A comment next to the `#define` still claims *"DCO3 (DG411) defines this; DCO4
+> (active-high / FET) does not."* That comment is stale — the flag is correctly defined here.
+
+> **Open item.** The constant is **3000** cycles, roughly 1.8× the ~1700 the RC analysis calls
+> for. See section 13 before changing it: the amp-comp calibration is measured *with* the
+> current pulse width.
 
 ### 2.2 Why the pulse is a fixed absolute time, not a fraction of the period
 
 The engine computes the ramp as "period minus pulse minus overhead", so as pitch rises the ramp
 shrinks while the pulse stays put. The pulse is therefore a **growing fraction** of the cycle:
 
-| Note | Period | Pulse at 3000 | Pulse at 1700 |
-|------|--------|---------------|---------------|
-| 12 Hz | 18.75 M cycles | 0.016% | 0.009% |
-| 1 kHz | 225 k cycles | 1.3% | 0.76% |
-| 7 kHz | 32.1 k cycles | **9.3%** | 5.3% |
+| Note | Period @225 MHz | Pulse at 3000 | Pulse at 1700 |
+|------|-----------------|---------------|---------------|
+| 12 Hz | 18.75 M cycles | 0.016 % | 0.009 % |
+| 1 kHz | 225 k cycles | 1.3 % | 0.76 % |
+| 7 kHz | 32.1 k cycles | **9.3 %** | 5.3 % |
 
-Making the pulse proportional to the period would hold the duty constant, but it would require
-rewriting Y on every control frame, which is unsafe on a running state machine (section 6), and
-it would invalidate the amp-comp tables. Fixed is the right call; the open question is only the
-*value*.
+Making the pulse proportional to the period would hold duty constant, but it would require
+rewriting Y on every control frame — unsafe on a running state machine (section 6) — and it
+would invalidate the amp-comp tables. Fixed is the right call; the open question is the *value*.
 
 The absolute ceiling is `pioPulseLength + overhead` = 3012 cycles = **74.7 kHz**, so the pulse
 is nowhere near limiting playable pitch. What it costs at the top of the range is ramp
@@ -109,268 +150,141 @@ amplitude, which the amp-comp tables compensate.
 
 ### 3.1 Each voice pair must share one PIO block
 
-```c
-static constexpr uint8_t VOICE_TO_PIO[NUM_OSCILLATORS] = { 0, 0, 0, 0, 1, 1, 1, 1 };
-```
+Hard sync works by pointing the **master's sideset** at the **slave's RESET pin**. Two state
+machines can only drive the same pin if they are in the same PIO block, because the pin's
+function select belongs to whichever block called `pio_gpio_init()` last.
 
-Voices 0–1 (osc 0–3) live on **pio0**; voices 2–3 (osc 4–7) on **pio1**. A GPIO's function select
-can name **exactly one** PIO block. Hard sync works by having two state machines drive the *same*
-reset pin, which is only possible when both are in the same block.
+`VOICE_TO_PIO[] = {0,0,0,0,1,1,1,1}` — voices 0–1 (osc 0–3) on **pio0**, voices 2–3 (osc 4–7) on
+**pio1**. Each A+B pair is inside one block, which is the only property sync depends on.
 
-This is the bug the 3-osc layout hit with `VOICE_TO_PIO = {0,1,2}`: calling
-`pio_gpio_init(pio[1], 29)` to let OSC2 reach OSC1's reset pin silently re-pointed GPIO 29 from
-PIO0 to PIO1 — so OSC1's own state machine could no longer drive its own core. On 4×2 the same
-rule applies **per voice pair** (A+B), not across all eight oscillators.
-
-```mermaid
-flowchart LR
-  subgraph broken [Separate blocks - pin gets stolen]
-    S2["OSC2 SM on PIO1"] -->|sideset| P29["GPIO 29"]
-    S1["OSC1 SM on PIO0"] -.->|"muxed away, cannot reach pin"| P29
-  end
-  subgraph fixed [One block - both reach the pin]
-    S1b["OSC1 SM, slave"] -->|"set pins"| P29b["GPIO 29"]
-    S2b["OSC2 SM, master"] -->|sideset| P29b
-  end
-```
-
-`pio_topology_report()` checks this at runtime by reading each RESET pin's function select back
-(section 12).
+> ⚠️ Earlier revisions of this page carried a DCO3-era invariant reading *"All oscillators stay
+> on PIO0"* and a bench expectation of `reset pin ownership: OK (all PIO0)`. That is **wrong for
+> this board** — with 8 oscillators the work is split across two blocks. The invariant that
+> still holds is *"a voice pair never straddles two blocks."*
 
 ### 3.2 Block budget
 
-| Block | Contents | Instructions used |
-|-------|----------|-------------------|
-| **PIO0** | 4 freq SMs (voices 0–1): `frequency_sync_4_jumps` + one of `frequency_sync_poll{,_2,_3}` | ~25–27 of 32 |
-| **PIO1** | 4 freq SMs (voices 2–3): same programs | ~25–27 of 32 |
-| **PIO2** (RP2350 only) | 4 sub-osc SMs (`subosc_div2` / `subosc_div4`); pins TBD | 4–8 of 32 |
-| Noise LFSR | **not loaded** (CPU `DCO_Noise` only) | — |
-| RANGE dither | **off** (`RANGE0_PIO_DITHER_TEST` not feasible for 8 oscs) | HW PWM slices |
+| Block | Contents |
+|-------|----------|
+| pio0 | 4 freq SMs (osc 0–3) + resident free / poll / triangle program images |
+| pio1 | 4 freq SMs (osc 4–7) + the same images |
+| pio2 (RP2350 only) | `SUBOSC_PIO` — up to 4 sub-osc SMs, pins TBD |
 
-Only one soft-sync poll image is resident **per freq block**. Changing `softSyncChunks` among 1/2/3
-reloads that image via `pio_remove_program` / `pio_add_program` (section 7.4) on both pio0 and pio1.
+Program offsets are tracked per block (`pio_offset_free[]`, `pio_offset_sync[]`,
+`pio_offset_triangle[]`), which is why every address helper takes the oscillator index.
 
-RP2040 has no pio2: sub-osc param is stored but SMs are not claimed.
+There are **no spare SMs** on pio0/pio1. That is why `RANGE0_PIO_DITHER_TEST` is off — dither
+would need one SM per RANGE pin.
 
 ### 3.3 Pins
 
-Live map in [`globals.h`](../globals.h) / [`PINOUT.md`](PINOUT.md) (old DCO4 WEACT):
-
-| Signal | GPIO | Direction |
-|--------|------|-----------|
-| RESET ×8 | 29, 27, 19, 18, 15, 13, 12, **8** | pio0 (osc 0–3) / pio1 (osc 4–7) out |
-| RANGE ×8 | 28, 22, 17, 16, 14, 11, 9, 7 | HW PWM slice (`RANGE0_PIO_DITHER_TEST` off) |
-| PW ×4 | 3, 2, 4, 5 | PWM (one per MIDI voice) |
-| Cal sense | 10 | GPIO in |
-| SUB ×4 | **TBD** (`SUBOSC_PINS[]` = `0xFF`) | RP2350 pio2 out; wait on that voice’s OSC A RESET |
-
-GP8 is OSC8 RESET, not sub-osc.
+RESET and RANGE arrays are selected by `DCO_MCU_BOARD`; see [`PINOUT.md`](PINOUT.md).
+`pio_gpio_init()` is called on each oscillator's own RESET pin, and for hard sync also on the
+partner's pin being sideset. Reading a pin as input (soft sync `jmp pin`, sub-osc `wait`) needs
+**no** function select change, which is what keeps soft sync from stealing pins.
 
 ---
 
 ## 4. Resident and legacy programs
 
-| Program | Length | Loaded by `init_pio()` | Weight | Overhead | Role |
-|---------|--------|------------------------|--------|----------|------|
-| `frequency_sync_4_jumps` | 12 | **yes**, pio0+pio1 | 4 | 12 | Free-running and hard-sync oscillator |
-| `frequency_sync_poll` | 13 | one of three, pio0+pio1 | 5 | 13 | Soft-sync slave, N=1 (~40%) |
-| `frequency_sync_poll_2` | 14 | one of three, pio0+pio1 | 6 | 14 | Soft-sync slave, N=2 (~67%) |
-| `frequency_sync_poll_3` | 15 | one of three, pio0+pio1 | 7 | 15 | Soft-sync slave, N=3 (~86%) |
-| `noise_lfsr` | 12 | **no** (4×2) | — | — | Not loaded; CPU `DCO_Noise` only |
-| `subosc_div2` | 4 | RP2350 pio2 | — | — | Divide that voice’s OSC A by 2 |
-| `subosc_div4` | 8 | RP2350 pio2 | — | — | Divide that voice’s OSC A by 4 |
-| `range_pwm_dither` | 4 | **no** (4×2) | — | 1 clk/count | Not used; RANGE is HW PWM |
-| `frequency` | 18 | no | — | — | Legacy 8-chunk oscillator |
-| `frequency_sync` | 20 | no | — | — | Legacy sync experiment |
-| `frequency_pulse1` | 5 | no | — | — | Legacy PW generator |
-
-`noise_lfsr` is **not loaded** on 4×2 (no spare SM; CPU `DCO_Noise` only). Historical note: it
-required instruction memory origin 0 (`out pc, 1` XORs via absolute addresses 0/1).
+| Program | Where | Loaded? | Role |
+|---------|-------|:---:|------|
+| `frequency_sync_4_jumps` | `pico-dco.pio.h` | ✅ | Production saw core, free-running or hard-sync |
+| `frequency_sync_poll` / `_2` / `_3` | `pico-dco.pio.h` | ✅ one image | Soft-sync slave with 1/2/3 trailing polled chunks |
+| `dco_triangle` | **`state_machines.ino`** | ✅ | Production triangle core (odd indices), 11 instructions |
+| `subosc_div2` / `subosc_div4` | `pico-dco.pio.h` | RP2350 only | Sub-oscillator on pio2 |
+| `frequency` | `pico-dco.pio.h` | ❌ | Legacy |
+| `frequency_sync` | `pico-dco.pio.h` | ❌ | Legacy |
+| `frequency_pulse1` | `pico-dco.pio.h` | ❌ | Legacy |
+| `noise_lfsr` | `pico-dco.pio.h` | ❌ | Noise is CPU-side (`NOISE_ENGINE 2`); `dcoNoisePioBegin` is a no-op |
 
 ### 4.1 The `.pio.h` file is hand-maintained
 
-Arduino **never runs `pioasm`**. The checked-in [`pico-dco.pio.h`](../pico-dco.pio.h) is the
-actual build input; [`pico-dco.pio`](../pico-dco.pio) is documentation of intent. Adding or
-changing a program means hand-assembling the instruction words and keeping both files in step.
+Arduino never runs `pioasm`. The header is edited by hand and the `.pio` source has drifted —
+duplicate `.program frequency`, two `init_sm_pin` signatures — so it would not assemble today.
+**Keep the two in step manually**, and treat the header as authoritative.
 
-The encoding is documented inline above `frequency_sync_poll` in the header. In brief:
-
-```
-bits [15:13] opcode      000 JMP   001 WAIT   101 MOV   111 SET
-bit  [12]    sideset enable        (side_set 1 opt reserves 2 bits)
-bit  [11]    sideset data
-bits [10:8]  delay
-bits [7:0]   operand
-```
-
-JMP puts its condition in operand bits `[7:5]`: `010` = `x--`, `110` = `pin`. `pio_add_program`
-relocates JMP targets by the load offset, so addresses in the tables are program-relative.
-
-> **Trap.** [`pico-dco.pio`](../pico-dco.pio) has drifted from the header and **would not
-> assemble as-is**: it declares `.program frequency` twice (lines 1 and 234) and defines
-> `init_sm_pin` with two different signatures. The header has one of each. Do not assume the
-> `.pio` file can be fed to `pioasm` without cleanup first.
+Note that the triangle program lives in `state_machines.ino` rather than the generated header,
+so a `pioasm` regeneration would not touch it.
 
 ### 4.2 `frequency_sync_4_jumps`, annotated
 
+Offset-relative addresses, one full period:
+
 ```
-addr                                cycles        note
- 0   lp0:  jmp x-- lp0              Y + 1         reset pulse asserted, X = Y
- 1         mov x, OSR               1             load chunk count
- 2         set pins, 0   side 0     1             release reset, ramp begins
- 3   lp1:  jmp x-- lp1              clk_div + 1   chunk 1
- 4         mov x, OSR               1             re-read: picks up a new clk_div
- 5   lp2:  jmp x-- lp2              clk_div + 1   chunk 2
- 6         mov x, OSR               1
- 7   lp3:  jmp x-- lp3              clk_div + 1   chunk 3
- 8         mov x, OSR               1
- 9   loop_final: jmp x-- loop_final clk_div + 1   chunk 4
-10         mov x, y                 1             X = Y for the next reset
-11         set pins, 1   side 1     1             assert reset, wraps to lp0
+  a11 set pins,1        1              ; assert reset (SET works here — see §1.1)
+  a0  lp0               Y + 1          ; hold the pulse
+  a1  mov x, OSR        1
+  a2  set pins,0        1              ; release; ramp starts
+  a3  lp1               clk_div + 1    ; chunk 1
+  a4  mov x, OSR        1
+  a5  lp2               clk_div + 1    ; chunk 2
+  a6  mov x, OSR        1
+  a7  lp3               clk_div + 1    ; chunk 3
+  a8  mov x, OSR        1
+  a9  loop_final        clk_div + 1    ; chunk 4  ← phase-hold target
+  a10 mov x, y          1              ; reload pulse width
+=> period = Y + 4*clk_div + 12
 ```
 
-`mov x, OSR` is a **non-destructive** re-read, so the OSR keeps holding `clk_div` and every chunk
-reloads the same value. That is what lets the CPU change pitch mid-period (section 6).
+`jmp x-- lp` executes **X+1** times: it jumps while X is non-zero, then spends one more cycle
+falling through at X == 0. All five delay loops therefore cost one cycle beyond their count —
+the reason `T_LOW_OVERHEAD_CYCLES` is **10**, not 5.
 
 ### 4.3 Soft-sync poll programs
 
-Three variants differ only in how many **trailing** chunks use the 2-cycle poll loop. N=1
-(`frequency_sync_poll`) is identical to the free program for addresses 0–8; the final chunk
-gains a poll:
-
-```
- 9   loop_final: jmp pin, do_sync   1     branch if master's reset is high
-10         jmp x-- loop_final       1     otherwise keep counting
-11   do_sync: mov x, y              1     sync branch and count-expired converge here
-12         set pins, 1   side 1     1
-```
-
-N=2 / N=3 (`frequency_sync_poll_2` / `_3`) convert successive trailing chunks the same way and
-share one `do_sync` tail. Lengths are 13 / 14 / 15 instructions; restart addresses are 11 / 12 / 13.
-Phase-align hold targets (last `jmp x--` before `mov x, y`) are free **9**, poll-1 **10**,
-poll-2 **11**, poll-3 **12** (`PIO_PHASE_HOLD_ADDR_*` in [`globals.h`](../globals.h)).
-
-Both the sync branch and the ordinary count-expired fall-through land on `do_sync`. Each polled
-chunk costs **2 cycles per iteration**, so weight = `4 + N`.
-
-`sm_config_set_jmp_pin` points the slave at the master's reset GPIO. PIO input sampling reads the
-pad regardless of function select, so a slave can read a pin another state machine drives.
+The slave's trailing chunks are replaced with a `jmp pin` + `jmp x--` pair, costing **2 cycles
+per iteration** instead of 1. Each polled chunk therefore counts **twice** toward the ramp
+weight. One resident image at a time; `ensure_soft_sync_program(n)` swaps it (remove + add) and
+tracks which is loaded in `pio_loaded_sync_chunks`.
 
 ### 4.4 RANGE dither PWM (`range_pwm_dither`)
 
-Hand-encoded in [`range_pwm_dither.pio.h`](../range_pwm_dither.pio.h) (not `init_pio()`). Intent is
-commented in [`pico-dco.pio`](../pico-dco.pio). Flag: `RANGE0_PIO_DITHER_TEST` in [`DCO.ino`](../DCO.ino)
-— **off on 4×2** (not feasible for 8 oscs). Comment out = hardware slice PWM on all eight
-`RANGE_PINS[]` (`wrap = DIV_COUNTER` = `RANGE_PWM_WRAP` in [`project_config.h`](../../project_config.h)). Voice/amp-comp still write **0..`DIV_COUNTER`** via `write_range_pwm()`.
-
-1-cycle-per-count sideset PWM (beats slice wrap-`DIV_COUNTER` ripple; carrier ≈ `clk_sys / (DIV_COUNTER + 1)`):
-
-```
-.side_set 1 opt
-.wrap_target
-    out x, 16              ; high counts (autopull 32)
-    out y, 16              ; low counts
-high:
-    jmp x-- high  side 1
-low:
-    jmp y-- low   side 0
-.wrap
-```
-
-DMA word = `(low << 16) | high`. Period **`DIV_COUNTER / RANGE_PIO_FRAMES`**; 3 frames →
-`RANGE_PIO_LEVELS` effective levels (`t = level * RANGE_PIO_LEVELS / DIV_COUNTER`, then
-`base = t/3`, `rem = t%3`, frame *i* gets `base + (i < rem)`).
-The integer remainder vs analog noise is negligible. Waveform is PIO+DMA (no CPU); each amp
-update is `range_pio_set_level` (~sub-µs).
-
-RP2040 DMA ring only wraps at **2^n bytes**, so 3 words cannot use ring mode. Each osc uses a
-**data + control** DMA pair: data transfers 3 words to the SM TX FIFO then chains to control,
-which rewrites `al3_read_addr_trig` and restarts. Six DMA channels total.
-
-| Osc | Pin | PIO |
-|-----|-----|-----|
-| 0 | GP17 | pio1 SM2 |
-| 1 | GP16 | pio1 SM3 |
-| 2 | GP14 | pio0 SM3 |
-
-Autotune must not steal RANGE pins as GPIO when the flag is on; park full-on with
-`range_pio_set_level(osc, DIV_COUNTER)`.
+Off on this board (`RANGE0_PIO_DITHER_TEST` undefined). All eight RANGE pins use hardware PWM
+slices with `wrap = DIV_COUNTER`. See [`PINOUT.md`](PINOUT.md) for the slice-sharing caveat on
+Resonance 1.
 
 ---
 
 ## 5. The period model
 
 ```
-period = Y + weight * clk_div + overhead
+period = Y + ramp_weight * clk_div + period_overhead
 ```
 
-| Program | weight | overhead |
-|---------|--------|----------|
-| `frequency_sync_4_jumps` (chunks 0) | 4 | 12 |
-| `frequency_sync_poll` (chunks 1) | 5 | 13 |
-| `frequency_sync_poll_2` (chunks 2) | 6 | 14 |
-| `frequency_sync_poll_3` (chunks 3) | 7 | 15 |
+```c
+static constexpr uint32_t T_HIGH_OVERHEAD_CYCLES = 2;
+static constexpr uint32_t T_LOW_OVERHEAD_CYCLES  = 10;
+static constexpr uint32_t NUM_OSR_CHUNKS         = 4;
 
-Tables: `PIO_RAMP_WEIGHT_BY_CHUNKS[]` / `PIO_PERIOD_OVERHEAD_BY_CHUNKS[]` in [`globals.h`](../globals.h).
-`PIO_RAMP_WEIGHT_SYNC` / `PIO_PERIOD_OVERHEAD_SYNC` remain aliases for the N=1 row.
+static constexpr uint32_t PIO_RAMP_WEIGHT_BY_CHUNKS[4]     = { 4, 5, 6, 7 };
+static constexpr uint32_t PIO_PERIOD_OVERHEAD_BY_CHUNKS[4] = { 12, 13, 14, 15 };
+```
+
+Index by `softSyncChunks`: `0` = free or hard sync, `1..3` = soft-sync trailing polled chunks.
+`PIO_*_FREE` aliases index 0 and `PIO_*_SYNC` aliases index 1.
 
 ### 5.1 Where overhead = 12 comes from
 
-`jmp x-- lp` executes **X + 1** times: it jumps while X is non-zero, then burns one more cycle
-falling through when X reaches 0. All five delay loops pay that extra cycle. Summing the
-annotated listing in 4.2:
-
-```
-five loop fall-throughs        5
-set pins,1 / set pins,0        2
-five mov instructions          5
-                              ---
-overhead                       12
-```
-
-Each polled chunk adds one extra fall-through cycle (the 2-instruction loop falls through both
-instructions), so overhead is `12 + N` for N trailing polled chunks.
-
-**This corrected a real tuning error.** The old constants were `T_HIGH_OVERHEAD_CYCLES = 2` plus
-`T_LOW_OVERHEAD_CYCLES = 5`, totalling 7 — short by exactly the five loop fall-throughs. Every
-note ran 5 cycles fast. That is proportionally worse as pitch rises: about **0.27 cents sharp at
-7 kHz**, and it was larger than the chunk quantisation error the remainder trick was introduced
-to fix.
+Instruction counting on the annotated listing in §4.2: five `+1` loop fall-throughs, four
+`mov x, OSR`, one `mov x, y`, two `set pins` = 12 cycles that are not `Y` and not
+`4 × clk_div`. `T_HIGH_OVERHEAD_CYCLES` (2) and `T_LOW_OVERHEAD_CYCLES` (10) split the same 12
+between the pulse and the ramp for the note-on splitter.
 
 ### 5.2 Two solvers, and when each applies
 
-Both live in [`globals.h`](../globals.h).
+| Helper | Used | Behaviour |
+|--------|------|-----------|
+| `pio_period_split(total, w, k)` | **Note-on only** | Chooses both `clk_div` **and** `Y`; can rewrite the pulse width to absorb the remainder |
+| `pio_clk_div_for_y(total, y, w, k)` | **Every control frame** | `Y` is fixed; solves the rounded `clk_div` only |
 
-**`pio_period_split(total, weight, overhead)` — exact.** Used at note-on only.
-
-```c
-uint32_t ramp = total_cycles - overhead - pioPulseLength;
-p.clk_div = ramp / weight;
-p.y       = pioPulseLength + (ramp % weight);   // remainder rides in the reset pulse
-```
-
-The division remainder is parked in the reset pulse instead of being discarded, so
-`y + weight*clk_div + overhead == total_cycles` **exactly**. The pulse jitters by 0 to
-`weight - 1` cycles, at most 13 ns, which is nothing against a 13 us pulse.
-
-**`pio_clk_div_for_y(total, y, weight, overhead)` — rounded.** Used every control frame.
-
-```c
-uint32_t ramp = total_cycles - overhead - y;
-return (ramp + weight / 2u) / weight;
-```
-
-Solves for `clk_div` against the Y the state machine is **already holding**, so the pulse and the
-ramp always describe the same period. Rounded rather than exact, so the error is bounded at
-`+/- weight/2`, i.e. **+/- 2 cycles**.
+This split exists because Y cannot be written to a running SM (§6.2).
 
 ### 5.3 Resulting accuracy
 
-| Situation | Error |
-|-----------|-------|
-| Note-on / held note | 0 cycles (exact) |
-| During glide, vibrato, modulation | +/- 2 cycles (~0.11 cents at 7 kHz, less below) |
-| Before this rework | -5 cycles systematic, plus +/- 2 quantisation |
+`clk_div` is an integer, so the achievable period is quantised in steps of `ramp_weight` cycles
+— 4 cycles free-running. At 225 MHz that is 17.8 ns, negligible at low pitch and a few cents at
+the very top of the range, which the note-on splitter mops up by adjusting Y.
 
 ---
 
@@ -378,63 +292,27 @@ ramp always describe the same period. Rounded rather than exact, so the error is
 
 ### 6.1 Why four chunks
 
-The ramp is split into four equal chunks, each re-reading `clk_div` from the OSR. A pitch change
-written to the OSR takes effect at the **next chunk boundary**, not the next period. At the
-bottom of the range that matters enormously: a 12 Hz note is 83 ms long, so waiting for a period
-boundary would make low notes feel broken. Four chunks cut worst-case update latency to ~21 ms.
+The ramp is split into four equal `clk_div` counts, each preceded by `mov x, OSR`. A new
+divider pushed mid-ramp is picked up at the **next chunk boundary**, so worst-case update
+latency is a quarter period rather than a whole one — the difference between sluggish and
+responsive modulation at low notes.
 
-This is why the programs use `mov x, OSR` and **not** `pull`. Do not "improve" this by adding
-`pull noblock` to make updates atomic per period — that reintroduces the latency the chunks exist
-to remove.
+> **Do not add `pull noblock` to the chunk loop.** It would restore exactly the latency the
+> chunks exist to remove.
 
 ### 6.2 The OSR race, and why Y is only written at note-on
 
-This is the central constraint of the whole design, and the reason the remainder trick is not
-applied on every control frame.
+The chunk loop re-reads the OSR every chunk. Writing Y (`out y, 31`) consumes the OSR, so a Y
+write on a **running** SM races the chunk reads and can strand the oscillator with a garbage
+divider for a period or more.
 
-**Y can only be loaded through the OSR.** There is no instruction that writes a 3000-ish
-immediate into Y, so the sequence is `pio_sm_put(y)`, `pull`, `out y, 31`. But the OSR
-*simultaneously* holds `clk_div` for the four `mov x, OSR` chunk reads.
-
-So on a **running** state machine there is a window where the OSR holds the pulse width instead
-of the divider. If a chunk executes `mov x, OSR` inside that window, it latches ~3000 as its ramp
-count instead of ~7000 — a chunk that finishes in a fraction of the expected time. That is a very
-audible glitch, and with four chunks per period at a ~1 kHz control rate it would land every few
-seconds.
-
-```mermaid
-flowchart TD
-  A["Note-on for OSC1 and OSC2"] --> B["pio_set_sm_mask_enabled(mask, false)"]
-  B --> C["osc_load_periods_stopped_noclear: Y + clk_div"]
-  C --> D["OSC1 jmp restart"]
-  D --> E{"deg != 0?"}
-  E -->|no| F["OSC2 jmp restart"]
-  E -->|yes| G["osc_phase_align_hold_stopped: out x, restore clk_div, set pins 0, jmp loop_final"]
-  F --> H["pio_enable_sm_mask_in_sync(mask)"]
-  G --> H
-```
-
-Stopping the SM closes the window entirely, and note-on is the natural place to do it: the
-envelope is at the start of its attack, so the phase discontinuity is inaudible.
-
-Hence the split in 5.2 — exact at note-on, rounded while running. Held notes and new notes are
-perfectly tuned; only active modulation falls back to +/- 2 cycles, which is inaudible and no
-worse than before.
-
-> **Invariant.** Never write Y to a running state machine. Use
-> `osc_load_period_stopped()` between a disable and an enable, or `osc_set_reset_pulse()` which
-> handles the stop/start itself.
+**Never write Y to a running state machine.** Stop it, load, restart —
+`osc_load_period_stopped()` and `osc_reload_reset_pulse_all()` both do this.
 
 ### 6.3 Writing Y consumes the OSR
 
-`out y, 31` shifts the OSR out. After it, the OSR no longer holds a valid divider, so the next
-`mov x, OSR` would read shifted-out zeros and the oscillator would scream at ~74 kHz for a
-control frame.
-
-Every Y write must therefore be followed by re-pushing `clk_div`. That is the entire reason
-`osc_last_clk_div[NUM_OSCILLATORS]` exists: callers that only want to change the pulse width
-(`osc_set_reset_pulse()`, `start_voice_sms()`) need a divider to restore, and they take the last
-one the engine pushed.
+Every Y write must be followed by re-pushing `osc_last_clk_div[osc]`, which is why that array
+exists. `start_voice_sms()` preloads Y and then re-pushes the divider for the same reason.
 
 ---
 
@@ -442,200 +320,92 @@ one the engine pushed.
 
 ### 7.1 Roles
 
-`syncMode` selects which oscillator is the slave **within each voice pair** (`DCO_A = v*2`,
-`DCO_B = v*2+1`). Pairs are independent.
+```cpp
+static inline int pair_slave(int voice) {
+  if (syncMode == 0) return -1;
+  return (voice << 1) + (syncMode - 1);   // mode 1 → A, mode 2 → B
+}
+static inline int pair_master(int voice) {
+  if (syncMode == 0) return -1;
+  return (voice << 1) + (2 - syncMode);   // mode 1 → B, mode 2 → A
+}
+```
 
-| `syncMode` | Master | Slave | Meaning |
-|------------|--------|-------|---------|
-| 0 | — | — | A and B independent |
-| 1 | B | A | B’s sideset drives A’s reset pin |
-| 2 | A | B | A’s sideset drives B’s reset pin |
+`syncMode` 0 = off, 1 = B drives A, 2 = A drives B. Both return −1 when sync is off, which is
+the "no role" sentinel every caller checks.
 
-Resolved by `pair_slave()` / `pair_master()` in [`state_machines.ino`](../state_machines.ino).
+> These were called `sync_slave_osc()` / `sync_master_osc()` in earlier revisions. The live
+> names are **`pair_slave()` / `pair_master()`**, and they take a **voice** index, not an
+> oscillator index.
 
 ### 7.2 The state machine index invariant
 
-When two state machines write the same pin on the same cycle, **the higher-numbered one wins**.
-If the master were numbered below its slave, then every time the master's reset assertion
-coincided with the slave's release, the master would lose and the sync edge would vanish — an
-occasional click with no obvious cause.
-
-`assign_sm_mapping()` therefore rewrites `VOICE_TO_SM` so the slave always sits **below** its
-master:
-
-Default `VOICE_TO_SM` is `{0,1,2,3, 0,1,2,3}` (`i & 3` — local SM within each PIO block). Sync
-is **per voice pair** (A = `v*2`, B = `v*2+1`):
-
-| `syncMode` | Pair roles | Local SM swap if needed |
-|------------|------------|-------------------------|
-| 0 | none | leave `i & 3` |
-| 1 | A slave, B master | slave SM < master SM |
-| 2 | B slave, A master | swap within the pair if B’s SM was higher |
-
-This is why `VOICE_TO_SM` is **mutable**, unlike `VOICE_TO_PIO`. `start_voice_sms()` reconfigures
-all eight SMs across pio0 and pio1.
+When two SMs write the same pin on the same cycle, **the higher-numbered SM wins**.
+`assign_sm_mapping()` therefore permutes `VOICE_TO_SM[]` so the **slave sits below its master**
+inside the block. Call it *before* `start_voice_sms()`.
 
 ### 7.3 Hard sync versus soft sync
 
-Selected by `softSyncChunks` (parameter `PARAM_SOFT_SYNC`, id 36).
-
-| | Hard sync (`softSyncChunks` = 0) | Soft sync (`softSyncChunks` = 1..3) |
+| | Hard sync | Soft sync |
 |---|---|---|
-| Mechanism | Master's sideset also drives the slave's reset pin | Slave polls master's pin with `jmp pin` |
-| Program on slave | `frequency_sync_4_jumps` | `frequency_sync_poll` / `_2` / `_3` |
-| Weight | 4 | 5 / 6 / 7 |
-| Effect on slave | Discharges the capacitor only; the slave's counter keeps running | Restarts the slave's own count |
-| Character | Analog-cap-only reset, as on DCO4 | Textbook hard/soft sync |
-| Receptive window | Always | Last ~40% / ~67% / ~86% of the ramp |
+| Mechanism | Master's sideset points at the **slave's** RESET pin | Slave polls the master's pin with `jmp pin` |
+| Ramp weight | 4 (free) | 5 / 6 / 7 for 1 / 2 / 3 polled chunks |
+| Effect | Discharges the slave's cap; its counter keeps running | Restarts the slave's own count |
+| Cost | None | Polled chunks run at half speed |
 
-They sound different and both are worth having. Hard sync leaves the slave's schedule intact, so
-its counter and its actual output disagree until the next wrap. Soft sync genuinely restarts the
-slave.
+Hard sync is analog-cap-only: it dumps the integrator without restarting the slave's schedule.
 
-In soft-sync mode the master leaves its sideset on **its own** pin — otherwise both mechanisms
-would fire at once.
-
-Either flavour makes the slave depend on a *running* master, so **manual calibration forces a
-neutral topology**: it solos one oscillator by stopping every other state machine, and a stopped
-master leaves its slave's reset pin dead (hard sync) or its polled pin static (soft sync), so the
-soloed oscillator would fall silent. `apply_param_manual_calibration_flag()` saves `syncMode` /
-`softSyncChunks`, zeroes them, and asks core 1 to rebuild through `calSyncNeutralRequested`
-(`loop1()`'s manual-cal branch, since that branch never reaches `pio_defer_service()`); exit
-restores the pair before `restore_voice_engine_after_calibration()` calls `start_voice_sms()`
-again. A `PARAM_SYNC_MODE` / `PARAM_SOFT_SYNC` write arriving mid-walk is booked for the exit
-instead of applied.
+**Manual calibration forces `syncMode` to 0.** Cal solo stops the partner of every pair, and a
+synced slave cannot reset itself without a running master.
 
 ### 7.4 Soft-sync thresholds
 
-Polling only trailing chunks means master edges arriving earlier in the slave's cycle are
-ignored, which is exactly what makes sync "soft". Because each polled chunk runs at 2 cycles per
-iteration, N trailing chunks occupy `2N / (4+N)` of the ramp time:
-
-| Polled chunks | Weight | Receptive window | Program length | Resident with free |
-|---------------|--------|------------------|----------------|--------------------|
-| 1 | 5 | ~40% (`2/5`) | 13 | 25/32 |
-| 2 | 6 | ~67% (`4/6`) | 14 | 26/32 |
-| 3 | 7 | ~86% (`6/7`) | 15 | 27/32 |
-
-All three are implemented. A freq block cannot hold free + every poll variant at once (12+13+14 = 39),
-so `ensure_soft_sync_program()` keeps **exactly one** poll image beside `frequency_sync_4_jumps`
-on **each** of pio0 and pio1, and swaps it when `softSyncChunks` changes among 1/2/3. Hard sync
-leaves the current poll image resident unused.
+Receptive window ≈ **40 % / 67 % / 86 %** of the ramp for N = 1 / 2 / 3, because polled chunks
+run at half speed. Swap images with `ensure_soft_sync_program(n)` while the SMs are stopped.
 
 ---
 
 ## 8. Phase align
 
-`oscPhaseSync` (degrees, via `PARAM_OSC_PHASE_SYNC`) offsets **DCO_B**’s first flyback relative
-to **DCO_A** at note-on (per voice pair). It applies only when `oscPhaseSync > 1`. Heard DCO "phase" is that reset edge,
-not the analog ramp start. Mono only (`voiceMode == 0`).
-
-That one parameter carries three regimes, because `oscPhaseSync` also gates the note-on restart
-itself in [`voices.ino`](../voices.ino):
-
-| `oscPhaseSync` | At note-on |
-|-----------|------------|
-| 0 | Nothing. The oscillators run straight through, so their phase relationship at note-on is whatever it happens to be — free running |
-| 1 | OSC1 and OSC2 are stopped and restarted together, with no offset |
-| 2..8 | The same restart, plus a fixed OSC2 offset of 45 to 315 degrees in 45 degree steps |
-| >8 | The same restart, with the offset in degrees being `oscPhaseSync * 2` |
-
-When `oscPhaseSync >= 1`, `note_retrig_mode` selects how that restart loads period state (`PARAM_DEBUG_COMMAND` **26** / **27**, or `NOTE_RETRIG_MODE_DEFAULT` in `DCO.ino`):
-
-| Mode | Value | Behavior |
-|------|------:|----------|
-| `EXACT_Y` | 0 (default) | disable → `pio_period_split` via `osc_load_periods_stopped_noclear` → OSC1 restart; OSC2 restart or `osc_phase_align_hold_stopped` → `enable_in_sync` |
-| `SYNC_JMP` | 1 | jmp restart only on **running** SMs — no disable / Y load / X preload / `enable_in_sync`. Degree offsets need EXACT_Y |
-
-On EXACT_Y note-on frames, `pio_period_split` runs next to `phase align`, then the note-on
-block applies the stash. Load uses fused **noclear** (frame already did PIO put+pull so TX
-is empty); boot/topology still use `osc_load_period_stopped` with FJOIN clear. Profiler:
-`retrig period split` under `voice_task_fixed_point`; `retrig SM apply` + `retrig RANGE PWM` under
-`note-on retrigger` (one SM-apply probe — do not slice disable/load/jmp/enable). See
-[`BENCHMARKING.md`](BENCHMARKING.md).
-
-`SYNC_JMP` is for A/B listening (near-sync from consecutive `exec`s, no no-RESET window). Static tuning may differ slightly vs exact-Y (same idea as free-run never getting the §5.2 rewrite). X preload is unsafe on a running SM, so SYNC_JMP is 0° only.
-
-Worth knowing when comparing 0 against the rest: with `EXACT_Y`, the exact-Y rewrite
-(`osc_load_periods_stopped_noclear`) runs only inside that gated block, so free running never
-receives the exact-period Y rewrite from 5.2 and keeps the rounded `clk_div` path for its
-whole life.
+`oscPhaseSync` holds the slave at `loop_final` for a computed number of cycles, then releases it
+so the two cores start their ramps at a chosen offset.
 
 ### 8.1 Why 0 / 90 / 180 used to be the only working offsets
 
-The working note-on recipe on the **18-instr `frequency` program** (wrap 17) was:
-
-```c
-pio_sm_exec(A, jmp(10 + pio_offset));
-pio_sm_exec(B, jmp(10 + pio_offset));
-put(pioPulseLength + phaseDelay); pull; out y, 31; out x, 31;  // OSC2 only
-```
-
-Address **10** there is mid-ramp `jmp x--, 10`. OSC1 and OSC2 start at the same PC; OSC2's
-larger X delays its first flyback. Any degree worked.
-
-`frequency_sync_4_jumps` is 12 instructions. Address **10 is now `mov x, y` (restart)**. The
-old `jmp(10)` no longer delays time-to-flyback. A retrofit of 90° ramp-entry tables `{0,4,6,8}`
-plus residual Y-widen only hit real `mov x, OSR` points at 90° and 180°; other angles kept
-flybacks locked to OSC1 (same period, longer zero).
+The old recipe entered the ramp at a **chunk boundary**, so only quarter-period offsets were
+reachable.
 
 ### 8.2 One-shot hold on `loop_final` (current)
 
-Keep the 4-jump program. Retarget the old recipe to **`loop_final` = addr 9** (poll: 10 / 11 / 12).
-Y and `clk_div` stay on the normal `pio_period_split(total_cycles)` — no permanent Y widen.
+`osc_phase_align_hold_stopped(osc, x)` preloads X, restores `clk_div`, issues `set pins, 0` and
+jumps to `osc_phase_hold_target(osc)` — the address of `loop_final`, the last `jmp x--` before
+flyback (9 free; 10/11/12 for poll N = 1/2/3). Y stays the real pulse width, so later cycles are
+undistorted. `osc_phase_hold_x(total, deg)` computes the X preload with a Q24 multiply; a result
+of 0 means "just restart".
 
-```c
-per_deg   = (total_cycles2 * RECIP_360_Q24 + (1 << 23)) >> 24;  // total / 360
-remaining = per_deg * (360 - deg);                               // time until first flyback
-X         = remaining - 3;                                       // loop_final fallthrough + mov x,y + set pins,1
-```
+`NOTE_RETRIG_MODE_DEFAULT` selects the note-on behaviour: **`0` EXACT_Y** (Y load + phase hold,
+the default) or `1` SYNC_JMP (restart jmp only). **SYNC_JMP is 0° only** — a degree offset needs
+the stopped-SM X preload that only EXACT_Y performs. Runtime cmds 26/27.
 
-Note-on only (not every control frame). Free-program loop_final is 1 cycle/count; soft-sync slave already overrides flybacks so there is no `/2` poll path.
-
-EXACT_Y note-on:
-
-1. Stop OSC1+OSC2; load normal Y + `clk_div` (fused noclear).
-2. OSC1 jmp `osc_restart_target` (addr 10) — flyback now.
-3. OSC2, `deg != 0`: `osc_phase_align_hold_stopped` — `out x`, restore `clk_div`, `set pins, 0`,
-   jmp `osc_phase_hold_target` (`loop_final`).
-4. `pio_enable_sm_mask_in_sync`. Loop expires → `mov x, y` → `set pins, 1` (first flyback) →
-   wrap into a normal period forever.
-
-0° is both jmp restart. `deg == 0` or a remaining ≤ 3 cycles also uses restart.
-
-> **Trap.** `loop_final` skips `set pins, 0` at address 2. The helper drives it low before the
-> jmp. Omit that and OSC2 counts down with the reset switch still closed.
-
-`PIO_RAMP_ENTRY_*` / `osc_ramp_entry_target()` remain in [`globals.h`](../globals.h) but are
-**unused** by live phase-align.
+> 🔴 **The `set pins, 0` in this path is a no-op on odd oscillators.** `set0_instr` is built with
+> `pio_encode_set(pio_pins, 0)`, and triangle-core SMs have no SET pins configured (§1.1). On
+> even (saw) oscillators it works. If phase align is ever needed on an Osc B, that clamp has to
+> become a sideset or `pio_sm_set_pins_with_mask()` write.
 
 ---
 
 ## 9. Sub-oscillator
 
-Four instructions on **pio2** (RP2350 only) turn that voice’s OSC A reset pin into a 50% square
-one or two octaves down. Each master cycle presents one rising and one falling edge, so a
-`wait 1` / `wait 0` pair consumes exactly one master cycle. RP2040: param stored, no PIO.
+RP2350 only. `SUBOSC_PIO = 2`, one SM per voice (SM 0–3), each waiting on that voice's **OSC A**
+RESET pin (`RESET_PINS[v*2]`). `set_subosc_divide(divide)` reconfigures them; `0` stops them,
+`2` and `4` select `subosc_div2` / `subosc_div4`.
 
-```
-.program subosc_div2
-    wait 1 pin 0    side 0     ; output low
-    wait 0 pin 0
-    wait 1 pin 0    side 1     ; output high
-    wait 0 pin 0
-```
+The array is compiled **only** under `#if defined(PICO_RP2350)` and every entry is still
+`SUBOSC_PIN_UNASSIGNED` (`0xFF`), which the init skips. **GP8 is OSC8 RESET — do not reuse
+DCO3's single SUB pin.**
 
-`subosc_div4` uses four wait pairs per half-cycle for a second sub-octave. Selected by
-`subOscDivide` (0 = off, 2, 4) through `PARAM_SUBOSC_DIVIDE` (id 37).
-
-> **Trap.** `subosc_init()` points `sm_config_set_in_pins` at `RESET_PINS[v*2]` (that voice’s OSC A)
-> but must **not** call `pio_gpio_init` on it. That would move the RESET pad’s function select to
-> pio2 and steal the output away from pio0/pio1 — the same class of bug described in section 3.1.
-> Input sampling reads the pad directly and needs no function select change.
-
-Output pins are `SUBOSC_PINS[v]` — **TBD** (all `0xFF`; `set_subosc_divide()` skips unassigned).
-**GP8 is OSC8 RESET**, not a sub-osc out. Inaudible until four SUB GPIOs are assigned and the
-carrier has mixer inputs.
+Waiting on a pin needs no function select change, so the sub-osc SMs do not steal RESET pins
+from pio0/pio1.
 
 ---
 
@@ -645,50 +415,62 @@ carrier has mixer inputs.
 
 | Function | Purpose | Called from | Preconditions |
 |----------|---------|-------------|---------------|
-| `sync_slave_osc()` / `sync_master_osc()` | Resolve `syncMode` into oscillator indices, or -1 | `assign_sm_mapping()`, `start_voice_sms()`, `pio_topology_report()` | none |
+| `pair_slave(voice)` / `pair_master(voice)` | Resolve `syncMode` into oscillator indices, or −1 | `assign_sm_mapping()`, `start_voice_sms()`, `pio_topology_report()` | none |
 | `assign_sm_mapping()` | Rewrite `VOICE_TO_SM` so the slave sits below its master | `init_pio()`, `setSyncMode()` | Call **before** `start_voice_sms()` |
-| `init_pio()` | Load free + one poll image into pio0 and pio1 (8 freq SMs); RP2350: both sub-osc programs into pio2 | `setup1()` | Boot only |
+| `init_pio()` | Load free + poll + triangle images into pio0 and pio1 (8 freq SMs); RP2350: sub-osc programs into pio2 | `setup1()` | Boot only |
+| `dco_triangle_init(pio, sm, offset, pin)` | Configure a triangle-core SM (sideset only, **no SET pins**) | `start_voice_sms()` | Odd oscillator indices |
 | `ensure_soft_sync_program(n)` | Swap the resident poll image to N trailing chunks (1..3) | `init_pio()`, `start_voice_sms()` | SMs must be stopped |
-| `start_voice_sms()` | Ensure poll image; choose each SM's program, pins; apply RESET polarity; preload Y; start all eight SMs (per-block sync enable) | `init_pio()`, `setSyncMode()` | Safe to re-call whenever topology changes |
-| `pio_reset_pin_apply_polarity(pin)` | OUTOVER+INOVER invert/clear for `ENABLE_PIO_RESET_INVERT` | `start_voice_sms()` | RESET pins only |
-| `osc_load_period_stopped(osc, y, clk_div)` | Push Y then `clk_div` (with FJOIN clear) | `start_voice_sms()`, `osc_set_reset_pulse()` | **SM must already be stopped.** |
-| `osc_load_periods_stopped_noclear(...)` | Dual-osc Y + clk_div, no FJOIN | Both engine note-on EXACT_Y paths | After frame put+pull (TX empty); caller disable/enable |
-| `osc_phase_align_hold_stopped(osc, x)` | Preload X, restore clk_div, `set pins, 0`, jmp `loop_final` | Both engine note-on EXACT_Y paths when deg ≠ 0 | **SM must already be stopped**; after noclear load |
-| `osc_set_reset_pulse(osc, y)` | Change only Y, restoring `osc_last_clk_div[osc]` | `apply_PARAM_PHASE_ALIGN()` | Stops and restarts the SM itself; parameter path, not audio path |
-| `pio_topology_report()` | Print sync roles and verify each RESET pin’s function select matches `VOICE_TO_PIO[]` | Bench / diagnostics | Serial up |
-| `pio_period_probe(osc, clk_div)` | Park an oscillator at a fixed divider and print the predicted period | Bench | Disturbs the oscillator |
+| `start_voice_sms()` | Choose each SM's program and pins; apply RESET polarity; preload Y; start all eight with `pio_enable_sm_mask_in_sync()` per block | `init_pio()`, `setSyncMode()` | Safe to re-call whenever topology changes |
+| `pio_reset_pin_apply_polarity(pin)` | OUTOVER+INOVER invert for `ENABLE_PIO_RESET_INVERT` | `start_voice_sms()` | RESET pins only |
+| `osc_load_period_stopped(osc, y, clk_div)` | Push Y then `clk_div` (with FJOIN clear) | `start_voice_sms()`, deferred reset-pulse work | **SM must already be stopped** |
+| `osc_load_periods_stopped_noclear(...)` | Dual-osc Y + clk_div, no FJOIN | Both engines' note-on EXACT_Y paths | After frame put+pull; caller disables/enables |
+| `osc_phase_align_hold_stopped(osc, x)` | Preload X, restore clk_div, `set pins, 0`, jmp `loop_final` | Note-on EXACT_Y when deg ≠ 0 | **SM stopped**; see the SET caveat in §8.2 |
+| `osc_reload_reset_pulse_all()` | Re-arm every oscillator's Y, preserving the running period | Deferred queue (debug 160) | Stops and restarts each SM itself |
+| `pio_defer_request_reset_pulse_all()` | Queue the above from Core 0 | `apply_param_debug_command()` | — |
+| `pio_defer_request_sync_mode()` | Queue a sync-topology rebuild | `apply_param_sync_mode()`, `apply_param_soft_sync()` | — |
+| `pio_defer_request_subosc()` | Queue a sub-osc reconfigure | `apply_param_subosc_divide()` | — |
+| `pio_defer_request_period_probe()` | Queue a bench period probe | Debug cmds 2/3 | — |
+| `pio_defer_request_cal_restore()` | Queue a post-calibration restore | Autotune | — |
+| **`pio_defer_service()`** | **Drain the deferred queue** | `loop1()`, before `voice_task_main()` | Core 1 only |
+| `pio_topology_report()` | Print sync roles and verify each RESET pin's function select matches `VOICE_TO_PIO[]` | Debug cmd 1 | Serial up |
+| `pio_period_probe(osc, clk_div)` / `_run()` | Park an oscillator at a fixed divider and print the predicted period | Debug cmds 2/3 | Disturbs the oscillator |
+| `pio_probe_report_flush()` | Emit a queued probe report through the chunked output | `bench_poll_core0()` | — |
 | `pio_solve_period_model(...)` | Back-solve weight and overhead from two frequency readings | Bench | Two distinct dividers, same Y |
-| `set_subosc_divide(divide)` | (Re)configure per-voice sub-oscs on pio2 (RP2350); skip `0xFF` pins; 0 stops them | `init_pio()`, `apply_param_subosc_divide()` | none |
+| `set_subosc_divide(divide)` | (Re)configure per-voice sub-oscs on pio2; skip `0xFF`; 0 stops | `init_pio()`, deferred | RP2350 |
+| `start_voice_sms()` helpers `pair_master`/`pair_slave` | see above | | |
+
+> **The deferred-work layer is the safe way to touch PIO from Core 0.** Anything that must stop
+> an SM is queued with a `pio_defer_request_*()` and executed by `pio_defer_service()` at the top
+> of `loop1()`, before the voice task. Never stop an SM directly from Core 0.
 
 ### 10.2 [`globals.h`](../globals.h) inlines
-
-These live in `globals.h` rather than `state_machines.h` because they read state declared there,
-and `globals.h` is included first.
 
 | Inline | Returns |
 |--------|---------|
 | `osc_program_base(osc)` | Load offset of the program that oscillator is running |
-| `osc_restart_target(osc)` | Absolute address of `mov x, y` — jump here to retrigger a cycle (10 free; 11/12/13 for poll N=1/2/3) |
-| `osc_phase_hold_target(osc)` | Absolute address of `loop_final` (`jmp x--` before flyback): 9 free; 10/11/12 poll N=1/2/3 |
+| `osc_restart_target(osc)` | Absolute address of `mov x, y` — jump here to retrigger (10 free; 11/12/13 poll N=1/2/3) |
+| `osc_phase_hold_target(osc)` | Absolute address of `loop_final` (9 free; 10/11/12 poll) |
 | `osc_phase_hold_x(total, deg)` | X preload for that hold (Q24 mul/shift), or 0 → restart |
-| `osc_ramp_entry_target(osc, quarters)` | Unused by live phase-align (leftover 90° chunk entries) |
+| `osc_ramp_entry_target(osc, quarters)` | **Unused** by live phase align (leftover 90° chunk entries) |
 | `osc_ramp_weight(osc)` | 4, or 5/6/7 from `softSyncChunks` when the slave runs a poll program |
 | `osc_period_overhead(osc)` | 12, or 13/14/15 likewise |
-| `pio_period_split(total, w, k)` | Exact `{clk_div, y}` split; note-on only |
-| `pio_clk_div_for_y(total, y, w, k)` | Rounded `clk_div` for a fixed Y; every frame |
+| `pio_period_split(total, w, k)` | Exact `{clk_div, y}` split; **note-on only** |
+| `pio_clk_div_for_y(total, y, w, k)` | Rounded `clk_div` for a fixed Y; **every frame** |
+| `sys_clock_hz_refresh()` | Cache `clock_get_hz(clk_sys)`; once per core at boot |
 
 ### 10.3 Per-oscillator state
 
 | Variable | Meaning |
 |----------|---------|
-| `VOICE_TO_PIO[]` | Always `{0,0,0,0,1,1,1,1}`. Do not split a voice pair across blocks (section 3.1) |
-| `VOICE_TO_SM[]` | Mutable; permuted by `assign_sm_mapping()` |
-| `osc_uses_sync_program[]` | Which resident program each SM runs; drives all the weight/address helpers |
+| `VOICE_TO_PIO[]` | `{0,0,0,0,1,1,1,1}`. Never split a voice pair across blocks (§3.1) |
+| `VOICE_TO_SM[]` | `{0,1,2,3,0,1,2,3}`; permuted by `assign_sm_mapping()` |
+| `osc_uses_sync_program[]` | Which resident program each SM runs; drives the weight/address helpers. Always false for odd (triangle) oscillators |
 | `osc_last_y[]` | Y currently loaded; `pio_clk_div_for_y()` solves against it |
-| `osc_last_clk_div[]` | Last divider pushed, so a Y write can restore it (section 6.3) |
-| `softSyncChunks` | 0 = hard sync; 1..3 = soft sync trailing polled chunks |
-| `pio_loaded_sync_chunks` | Which poll image is currently in pio0 instruction memory (1..3) |
+| `osc_last_clk_div[]` | Last divider pushed, so a Y write can restore it (§6.3) |
+| `softSyncChunks` | 0 = hard/free; 1..3 = soft-sync trailing polled chunks |
+| `pio_loaded_sync_chunks` | Which poll image is resident (1..3) |
 | `subOscDivide` | 0 / 2 / 4 |
+| `pioPulseLength` | Reset pulse in cycles, default 3000 |
 
 ---
 
@@ -696,23 +478,27 @@ and `globals.h` is included first.
 
 Everything here is a trap that has already bitten, or would bite the next change.
 
-1. **All oscillators stay on PIO0.** Hard sync depends on two SMs sharing one pin's function
-   select. Splitting them across blocks silently breaks sync (section 3.1).
+1. **A voice pair never straddles two PIO blocks.** Hard sync needs two SMs sharing one pin's
+   function select. Osc 0–3 are on pio0 and osc 4–7 on pio1 — that is fine; splitting a *pair*
+   is not (§3.1).
 2. **Never `pio_gpio_init` an oscillator pin from another block.** It steals the pin. Reading a
-   pin as input needs no function select change (sections 3.1, 9).
-3. **Never write Y to a running state machine.** The OSR is shared with the chunk reads
-   (section 6.2).
-4. **Always re-push `clk_div` after writing Y.** `out y, 31` consumes the OSR (section 6.3).
-5. **The slave's SM index stays below its master's.** Higher SM wins a same-cycle pin write
-   (section 7.2).
-6. **Keep `.pio` and `.pio.h` in step by hand.** Arduino never runs `pioasm`, and the `.pio`
-   source currently would not assemble (section 4.1).
-7. **Do not add `pull noblock` to the chunk loop.** It would restore the low-note update latency
-   the chunks exist to eliminate (section 6.1).
-8. **Jumping to `loop_final` (phase hold) requires an explicit `set pins, 0` first** (section 8.2).
-9. **Changing `pioPulseLength` invalidates amp-comp calibration.** It is baked into the measured
-   gap tables (sections 2.1, 13). Runtime changes via debug 160 may need an amp-comp redo after
-   large Y moves.
+   pin as input needs no function select change (§3.1, §9).
+3. **Never write Y to a running state machine.** The OSR is shared with the chunk reads (§6.2).
+4. **Always re-push `clk_div` after writing Y.** `out y, 31` consumes the OSR (§6.3).
+5. **The slave's SM index stays below its master's.** The higher SM wins a same-cycle pin write
+   (§7.2).
+6. **`pio_encode_set` only works on even (saw) oscillators.** Triangle-core SMs have no SET pins
+   configured — the instruction is a silent no-op there (§1.1).
+7. **Touch PIO from Core 0 only through `pio_defer_request_*()`.** `pio_defer_service()` runs the
+   work on Core 1 before the voice task (§10.1).
+8. **Keep `.pio` and `.pio.h` in step by hand.** Arduino never runs `pioasm`, and the `.pio`
+   source would not assemble today (§4.1).
+9. **Do not add `pull noblock` to the chunk loop.** It would restore the update latency the
+   chunks exist to eliminate (§6.1).
+10. **Jumping to `loop_final` requires an explicit pad clamp first** — and on odd oscillators
+    that clamp must not be `set pins, 0` (§8.2).
+11. **Changing `pioPulseLength` invalidates amp-comp calibration.** It is baked into the measured
+    gap tables (§2.1, §13).
 
 ---
 
@@ -720,59 +506,52 @@ Everything here is a trap that has already bitten, or would bite the next change
 
 ### 12.0 How to invoke these
 
-Nothing in the firmware calls the three helpers below, so on a running board they are
-reached through `PARAM_DEBUG_COMMAND` (id 160): `1` runs the topology report, `2` and `3`
-run period probes at a low and a high divider. Values **200–50000** (unsigned 16-bit on the
-wire) set `pioPulseLength` instead of running an opcode. See `apply_param_debug_command()` in
-[`params.ino`](../params.ino).
+Nothing in the firmware calls the helpers below, so on a running board they are reached through
+`PARAM_DEBUG_COMMAND` (id **160**): `1` runs the topology report, `2` and `3` run period probes
+at a low and a high divider. Values **200–50000** set `pioPulseLength` instead of running an
+opcode. See `apply_param_debug_command()` in [`params.ino`](../params.ino).
 
-The easiest way to send that is the bench controller in
-[`tools/dco_control`](../tools/dco_control/README.md), which has a button for each on its
-Oscillators tab (Sync section) and shows the board's replies in a log pane. It also drives
-`PARAM_SOFT_SYNC` and `PARAM_SUBOSC_DIVIDE`, which have no Input-board UI, so it is the only
-way to exercise soft sync and the sub-oscillator.
+These requests are **queued**, not executed inline — they go through `pio_defer_request_*()` and
+run on Core 1 in `pio_defer_service()`.
 
-### 12.1 Confirm the sync fix
+The easiest way to send them is [`tools/dco_control`](../tools/dco_control/README.md), which has
+a button for each on its Oscillators tab. It also drives `PARAM_SOFT_SYNC` and
+`PARAM_SUBOSC_DIVIDE`, which have no Input-board UI, so it is the only way to exercise soft sync
+and the sub-oscillator.
+
+### 12.1 Confirm the sync topology
 
 ```c
-pio_topology_report();
+pio_topology_report();     // debug 160 value 1
 ```
 
-Expect every RESET pin to report PIO0 and the summary line:
+Expect each RESET pin to report the block from `VOICE_TO_PIO[]` — **pio0 for osc 0–3, pio1 for
+osc 4–7** — and the master/slave SM ordering from §7.2 to hold. Oscillators are printed
+**1-based** (OSC1..OSC8), which is why the PW-owning ones read as OSC1/3/5/7.
 
-```
-  reset pin ownership: OK (all PIO0)
-```
-
-Anything else means a pin has been stolen and sync cannot work, whatever it sounds like. The
-report also checks the master/slave SM ordering from section 7.2.
+> Do **not** expect "all PIO0". That expectation is left over from the 3-oscillator monosynth.
 
 Then listen: enable sync and sweep OSC1's detune. A **timbral formant sweep** means hard sync is
-working. If the pitch simply tracks with no change in character, the slave is being cloned rather
-than synced.
-
-Scoping the shared reset pin should show reset edges at both oscillators' rates.
+working. If the pitch simply tracks with no change in character, the slave is being cloned
+rather than synced. Scoping the shared reset pin should show reset edges at both rates.
 
 ### 12.2 Confirm the period model
 
-`overhead = 12` is derived by instruction counting (section 5.1). To confirm it on hardware,
-probe at two widely separated dividers with the same Y and back-solve.
+`overhead = 12` is derived by instruction counting (§5.1). To confirm on hardware, probe at two
+widely separated dividers with the same Y and back-solve.
 
 > **Run this with no note playing.** `pio_period_probe()` parks the oscillator at a fixed
-> `clk_div`, but `voice_task_main()` pushes a fresh divider every frame for a held note, so the
-> probe's value survives only until the next control frame. With all voices released the
-> voice task skips the oscillator entirely and the probe holds.
+> `clk_div`, but `voice_task_main()` pushes a fresh divider every frame for a held note. With all
+> voices released the voice task skips the oscillator and the probe holds.
 
 ```c
 pio_period_probe(0, 2000);    // read the frequency counter on the RESET pin
 pio_period_probe(0, 20000);   // read it again
-
 pio_solve_period_model(2000, hz_a, 20000, hz_b, pioPulseLength);
 ```
 
-It prints the measured weight and overhead against the expected constants. Weight should come out
-very close to an integer; a fractional result means the two readings were taken with different Y
-values or different programs.
+Weight should come out very close to an integer; a fractional result means the two readings used
+different Y values or different programs.
 
 ### 12.3 Confirm tuning
 
@@ -786,9 +565,11 @@ generated frequency should agree to the displayed precision.
 
 | Item | Detail |
 |------|--------|
-| **`pioPulseLength` = 3000 vs ~1700** | The RC analysis (section 2.1) calls for ~7.5 us; the constant is 13.3 us. Reducing it would recover ramp amplitude at the top of the range, but the amp-comp tables and `find_gap` calibration were measured with 3000, so it needs a full recalibration pass, not just a constant edit. |
-| **`.pio` source drift** | Duplicate `.program frequency`, two `init_sm_pin` signatures (section 4.1). Worth cleaning so the file could be assembled again as a cross-check on the hand-written header. |
-| **Hard-sync listening check** | The static and runtime checks pass, but the detune-sweep listening test in 12.1 has not been performed on hardware. |
-| **Sub-oscillator** | RP2350 pio2 SMs ready; `SUBOSC_PINS[]` still `0xFF`. Assign 4 GPIOs + mixer inputs before audible. |
-| **Soft-sync thresholds** | N=1/2/3 implemented via poll-program swap (section 7.4). Listening comparison across thresholds still open. |
-| **Legacy programs** | `frequency`, `frequency_sync`, `frequency_pulse1` are still in the header but never loaded. Removing them would free nothing at runtime, but would reduce confusion. |
+| **`pioPulseLength` = 3000 vs ~1700** | The RC analysis (§2.1) calls for ~7.5 µs; the constant is 13.3 µs. Reducing it would recover ramp amplitude at the top of the range, but the amp-comp tables and `find_gap` calibration were measured with 3000 — it needs a full recalibration pass, not a constant edit. |
+| **SET pins on the triangle core** | `dco_triangle_init()` never calls `sm_config_set_set_pins()`, so `pio_encode_set` is dead on odd oscillators (§1.1). Either configure SET there or migrate the affected call sites to sideset / `pio_sm_set_pins_with_mask()`. |
+| **`.pio` source drift** | Duplicate `.program frequency`, two `init_sm_pin` signatures (§4.1). Worth cleaning so the file could assemble again as a cross-check. |
+| **Triangle program location** | `dco_triangle` lives in `state_machines.ino`, not the generated header — easy to miss when regenerating. |
+| **Hard-sync listening check** | Static and runtime checks pass; the detune-sweep listening test in §12.1 has not been done on hardware. |
+| **Sub-oscillator** | RP2350 pio2 SMs ready; `SUBOSC_PINS[]` still `0xFF`. Assign 4 GPIOs + mixer inputs before it is audible. |
+| **Soft-sync thresholds** | N = 1/2/3 implemented via poll-program swap (§7.4). Listening comparison still open. |
+| **Legacy programs** | `frequency`, `frequency_sync`, `frequency_pulse1`, `noise_lfsr` are still in the header but never loaded. Removing them frees nothing at runtime but reduces confusion. |
