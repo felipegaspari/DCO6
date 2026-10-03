@@ -3,11 +3,35 @@
 
 #include <stdint.h>
 #include "hardware/pio.h"
+#include "hardware/dma.h"
+
+// --- DMA WAVESHAPING ARCHITECTURE ---
+// 64-word list, two halves. DMA rings 512 bytes (A then B). CPU writes the idle half.
+#define DCO_WAVE_SLOTS 64
+#define DCO_WAVE_NATIVE 32768u
+extern uint32_t dco_wave_buffer[NUM_VOICES_TOTAL][2][DCO_WAVE_SLOTS];
+
+// Declared here so the sketch prototype pass can see it. The .ino helpers
+// that take this type are prototyped before voices.ino is parsed.
+struct WaveSeg {
+    uint32_t cycles;
+    uint8_t dir;
+};
+extern int dco_dma_chan[NUM_VOICES_TOTAL];
+
+// DMA list holds one native-length period. Pitch is the SM clkdiv, updated
+// every voice_task frame so the open ramp time-warps with the note.
+int dco_wave_commit(uint8_t voice, const uint32_t* baked, uint16_t n);
+void dco_wave_set_clkdiv(uint8_t voice, uint32_t total_cycles);
+void dco_wave_invalidate_bake(uint8_t voice);
 
 void init_pio();
 void start_voice_sms();
 void assign_sm_mapping();
 void set_subosc_divide(uint8_t divide);
+
+// NEW: Phase resync for the DMA streamer (used during Retriggers)
+void reset_dco_dma_phase(uint8_t voice, PIO pio, uint sm, uint pio_block_idx);
 
 // Load a reset pulse width (Y) and clk_div into an oscillator whose SM is already
 // stopped. The caller is responsible for stopping and re-enabling, so that paired

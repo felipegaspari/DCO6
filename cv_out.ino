@@ -112,6 +112,26 @@
    cv_bake_lfo2_to_vcf_scale();
    cv_bake_lfo1_to_vca_scale();
  }
+
+ static constexpr uint32_t LFO_DEST_SLEW_US = 201u;
+
+ // Commit LFO Hz only when dest or SpeedVal changed. Dest-only changes are
+ // rate-limited; SpeedVal changes commit immediately. last-* update after commit.
+ static inline __attribute__((always_inline))
+ void SRAM_HOT(lfo_commit_speed_if_changed)(
+     lfo& obj, int32_t dest, uint32_t speed,
+     int32_t& last_dest, uint32_t& last_speed,
+     uint32_t& last_dest_flush_us) {
+   if (__builtin_expect((dest != last_dest) | (speed != last_speed), 0)) {
+     if (__builtin_expect(speed != last_speed, 0) ||
+         (timer_hw->timerawl - last_dest_flush_us) >= LFO_DEST_SLEW_US) {
+       last_dest = dest;
+       last_speed = speed;
+       last_dest_flush_us = timer_hw->timerawl;
+       obj.setMode0Freq(fast_exp_speed_5000((uint32_t)((int32_t)speed + dest)));
+     }
+   }
+ }
  
  // =============================================================================
  // 3. REALTIME CV & MODULATION MATRIX EXECUTION LOOP
@@ -202,23 +222,31 @@
    }
  
    // =========================================================================
-   // E. Control-Rate 200us Sub-Loop (Dynamic LFO Frequency Slew)
+   // E. LFO Frequency Commit (dest or SpeedVal change)
    // =========================================================================
    {
-     static uint32_t last_1ms_tick = 0;
-     const uint32_t now_us = micros();
-     if (now_us - last_1ms_tick >= 501) {
+     static int32_t last_l1_dest = 0, last_l2_dest = 0, last_l3_dest = 0;
+     static uint32_t last_l1_speed = 0, last_l2_speed = 0, last_l3_speed = 0;
+     static uint32_t last_dest_flush_us = 0;
+
+     const int32_t l1_dest = mod_matrix_get_dest_fast<DEST_LFO1_SPEED>(0);
+     const uint32_t l1_speed = (uint32_t)LFO1SpeedVal;
+     const int32_t l2_dest = mod_matrix_get_dest_fast<DEST_LFO2_SPEED>(0);
+     const uint32_t l2_speed = (uint32_t)LFO2SpeedVal;
+     const int32_t l3_dest = mod_matrix_get_dest_fast<DEST_LFO3_SPEED>(0);
+     const uint32_t l3_speed = (uint32_t)LFO3SpeedVal;
+
+     if (__builtin_expect(
+           (l1_dest != last_l1_dest) | (l1_speed != last_l1_speed) |
+           (l2_dest != last_l2_dest) | (l2_speed != last_l2_speed) |
+           (l3_dest != last_l3_dest) | (l3_speed != last_l3_speed), 0)) {
        BENCH_BEGIN(cv_lfo_subloop);
-       last_1ms_tick = now_us;
- 
-       int32_t l1_speed_mod = (int32_t)LFO1SpeedVal + mod_matrix_get_dest_fast<DEST_LFO1_SPEED>(0);
-       LFO1_class.setMode0Freq(fast_exp_speed_5000((uint16_t)l1_speed_mod), now_us);
- 
-       int32_t l2_speed_mod = (int32_t)LFO2SpeedVal + mod_matrix_get_dest_fast<DEST_LFO2_SPEED>(0);
-       LFO2_class.setMode0Freq(fast_exp_speed_5000((uint16_t)l2_speed_mod), now_us);
- 
-       int32_t l3_speed_mod = (int32_t)LFO3SpeedVal + mod_matrix_get_dest_fast<DEST_LFO3_SPEED>(0);
-       LFO3_class.setMode0Freq(fast_exp_speed_5000((uint16_t)l3_speed_mod), now_us);
+       lfo_commit_speed_if_changed(LFO1_class, l1_dest, l1_speed,
+                                   last_l1_dest, last_l1_speed, last_dest_flush_us);
+       lfo_commit_speed_if_changed(LFO2_class, l2_dest, l2_speed,
+                                   last_l2_dest, last_l2_speed, last_dest_flush_us);
+       lfo_commit_speed_if_changed(LFO3_class, l3_dest, l3_speed,
+                                   last_l3_dest, last_l3_speed, last_dest_flush_us);
        BENCH_END(cv_lfo_subloop);
      }
    }

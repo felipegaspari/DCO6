@@ -11,6 +11,7 @@
 // ========================================================
 // SETTINGS FILE !!!! CRITICAL
 // ========================================================
+#include "project_config.h"
 #include "settings.h"
 
 #include "_shared/memory_port.h"
@@ -120,7 +121,7 @@ void setup() {
   #endif
 
 
-  pinMode(DCO_calibration_pin, INPUT);
+  pinMode(DCO_calibration_pin, INPUT_PULLUP);
 
   #if (DCO_MCU_BOARD != DCO_MCU_WEACT_RP2350)
   pinMode(24, OUTPUT);

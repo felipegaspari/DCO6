@@ -144,6 +144,8 @@ void init_pwm() {
   // 1. Range Oscillators (These USE 16-step DMA Dithering @ ~285 kHz)
   for (int i = 0; i < NUM_OSCILLATORS; i++) {
     gpio_set_function(RANGE_PINS[i], GPIO_FUNC_PWM);
+    gpio_set_slew_rate(RANGE_PINS[i], GPIO_SLEW_RATE_FAST);
+    gpio_set_drive_strength(RANGE_PINS[i], GPIO_DRIVE_STRENGTH_4MA);
     RANGE_PWM_SLICES[i] = pwm_gpio_to_slice_num(RANGE_PINS[i]);
     RANGE_PWM_CHANNELS[i] = pwm_gpio_to_channel(RANGE_PINS[i]);
     pwm_set_wrap(RANGE_PWM_SLICES[i], DIV_COUNTER >> PWM_DITHER_BITS);
@@ -157,6 +159,8 @@ void init_pwm() {
       continue;
     }
     gpio_set_function(PW_PINS[i], GPIO_FUNC_PWM);
+    gpio_set_slew_rate(PW_PINS[i], GPIO_SLEW_RATE_FAST);
+    gpio_set_drive_strength(PW_PINS[i], GPIO_DRIVE_STRENGTH_4MA);
     PW_PWM_SLICES[i] = pwm_gpio_to_slice_num(PW_PINS[i]);
     PW_PWM_CHANNELS[i] = pwm_gpio_to_channel(PW_PINS[i]);
     

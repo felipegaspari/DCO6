@@ -750,8 +750,12 @@ static void SRAM_HOT(apply_param_adsr3_release)(int16_t v) { ADSR3_release = (ui
  // 7. PRESET STORE, CALIBRATION DUMP & RECALL
  // =============================================================================
  
- static void apply_param_preset_save(int16_t v) { preset_store_save((uint8_t)v); }
- static void apply_param_preset_load(int16_t v) { preset_store_load((uint8_t)v); }
+ static void apply_param_preset_save(int16_t v) { preset_store_save((uint8_t)v);}
+ static void SRAM_HOT(apply_param_preset_load)(int16_t v) {
+  // Execute a full, live-audition load using the lightning-fast DMA pipeline
+  currentPresetSlot = (uint8_t)v;
+  preset_store_load((uint8_t)v);
+}
  static void apply_param_preset_dump(int16_t v) { preset_store_dump((int16_t)v); }
  static void apply_param_cal_dump(int16_t v)    { preset_store_cal_dump(v); }
  static void SRAM_HOT(apply_param_ui_preset_scroll)(int16_t v) {
@@ -766,6 +770,24 @@ static void SRAM_HOT(apply_param_adsr3_release)(int16_t v) { ADSR3_release = (ui
  // =============================================================================
  // They now live in mod_matrix_engine.h
 
+// =============================================================================
+// TEST PARAMETERS
+// =============================================================================
+static void apply_param_test_1(int16_t v) {
+  test1 = (int16_t)v;
+}
+static void apply_param_test_2(int16_t v) {
+  test2 = (int16_t)v;
+}
+static void apply_param_test_3(int16_t v) {
+  test3 = (int16_t)v;
+}
+static void apply_param_test_4(int16_t v) {
+  test4 = (int16_t)v;
+}
+static void apply_param_test_5(int16_t v) {
+  test5 = (int16_t)v;
+}
 
  // =============================================================================
  // 8. ROUTER TABLE & DISPATCH JUMP SETUP
@@ -913,6 +935,13 @@ static void SRAM_HOT(apply_param_adsr3_release)(int16_t v) { ADSR3_release = (ui
      {PARAM_CAL_DUMP, apply_param_cal_dump},
      {PARAM_UI_PRESET_SCROLL, apply_param_ui_preset_scroll},
      {PARAM_DEBUG_COMMAND, apply_param_debug_command},
+
+     // --- Test Parameters ---
+     {PARAM_TEST_1, apply_param_test_1},
+     {PARAM_TEST_2, apply_param_test_2},
+     {PARAM_TEST_3, apply_param_test_3},
+     {PARAM_TEST_4, apply_param_test_4},
+     {PARAM_TEST_5, apply_param_test_5},
  };
  
  // =============================================================================

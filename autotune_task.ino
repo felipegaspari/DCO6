@@ -30,8 +30,8 @@ void autotune_drive_core(uint8_t osc, float freqHz, uint16_t ampValue) {
 // 2. Manual Calibration Loop (UI / Trimpot / PW editing)
 // =============================================================================
 void autotune_manual_task() {
-  static uint8_t lastManualStage = 0xFF;
-  static uint8_t lastDCO         = 0xFF;
+  static uint8_t  lastManualStage = 0xFF;
+  static uint8_t  lastDCO         = 0xFF;
 
   if (calSyncNeutralRequested) {
     calSyncNeutralRequested = false;
@@ -40,23 +40,19 @@ void autotune_manual_task() {
 
   currentDCO = cal_manual_osc();
   const uint8_t pwCh = cal_pw_channel(currentDCO);
-  
+
   bool is440Stage = cal_stage_is_440(manualCalibrationStage) || (manualCalibrationStep == 1);
   bool isPwEdit   = cal_stage_is_pw_edit(manualCalibrationStage);
   bool isSquare   = cal_stage_is_square(manualCalibrationStage);
-  
-  // Enable pulse for both Square wave stages AND PW edit stages
   bool wantPulse  = (isSquare || isPwEdit);
 
   // =========================================================================
   // 1. STAGE TRANSITION DETECTOR
   // =========================================================================
-  bool stageChanged = (manualCalibrationStage != lastManualStage);
+  const bool oscChanged   = (currentDCO != lastDCO);
+  const bool stageChanged = (manualCalibrationStage != lastManualStage) || oscChanged;
 
   if (stageChanged) {
-    bool oscChanged = (currentDCO != lastDCO);
-
-    // Mute all inactive oscillator range levels
     for (int i = 0; i < NUM_OSCILLATORS; i++) {
       if (i != currentDCO) {
         PIO pioN = pio[VOICE_TO_PIO[i]];
@@ -64,21 +60,19 @@ void autotune_manual_task() {
         pio_sm_set_enabled(pioN, sm1N, false);
         pio_sm_put(pioN, sm1N, 0);
         pio_sm_exec(pioN, sm1N, pio_encode_pull(false, false));
-        
-        // ADAPTATION: Update memory variable
-        write_range_pwm(i, 0);
+
+        pio_park_osc_reset((uint8_t)i, osc_park_reset_level((uint8_t)i));
+
+        write_range_pwm(i, DIV_COUNTER);
       }
     }
 
-    // ADAPTATION: Push zeroed levels to DMA buffer immediately
     flush_voice_pwm();
 
-    // Analog Discharge Drain pause when switching physical oscillators
     if (oscChanged && lastDCO != 0xFF) {
-      delay(150); 
+      delay(150);
     }
 
-    // Configure Audio Waveform MUX (routes Saw/Tri/Pulse to sound chain)
     update_CV_outs_manual_calibration();
 
     lastManualStage    = manualCalibrationStage;
@@ -90,22 +84,21 @@ void autotune_manual_task() {
   // 2. CONFIGURE PULSE WIDTH HARDWARE (Live Update)
   // =========================================================================
   if (wantPulse && osc_has_pw(currentDCO)) {
-    // Pulse / PW Edit Stage: Actively drive active channel with its PW_CENTER value
     apply_pw_center_solo(pwCh);
-    flush_voice_pwm(); // ADAPTATION: Commit PW center to DMA
+    flush_voice_pwm();
   } else {
-    // Saw / Tri Stage: Mute ALL Pulse channels via DMA-safe writers
+    const uint16_t muteVal = (currentDCO & 1) ? 0 : MUTE_PW_CHANNEL;
     for (uint8_t ch = 0; ch < NUM_PW_CHANNELS; ch++) {
       if (PW_PINS[ch] != PW_PIN_UNASSIGNED) {
-        voice_write_pw(ch, 0); // ADAPTATION: Safe DMA-backed writer
-        PW[ch] = 0;
+        voice_write_pw(ch, muteVal);
+        PW[ch] = muteVal;
       }
     }
-    flush_voice_pwm(); // ADAPTATION: Push muted PW to DMA
+    flush_voice_pwm();
   }
 
   // =========================================================================
-  // 3. CONTINUOUS LIVE UPDATE (Calculate Target Pitch & Amplitude)
+  // 3. CONTINUOUS LIVE UPDATE
   // =========================================================================
   if (is440Stage) {
     VOICE_NOTES[0] = manual_cal_reference_note;
@@ -114,25 +107,26 @@ void autotune_manual_task() {
     if (ampComp440[currentDCO] != 0) {
       ampCompCalibrationVal = ampComp440[currentDCO];
     } else {
-      float scale = note_to_freq(manual_cal_reference_note) / note_to_freq(manual_DCO_calibration_start_note);
-      ampCompCalibrationVal = (uint16_t)((initManualAmpCompCalibrationValPreset + manualCalibrationOffset[currentDCO]) * scale + 0.5f);
+      float scale = note_to_freq(manual_cal_reference_note) /
+                    note_to_freq(manual_DCO_calibration_start_note);
+      ampCompCalibrationVal = (uint16_t)((initManualAmpCompCalibrationValPreset +
+                                          manualCalibrationOffset[currentDCO]) * scale + 0.5f);
     }
   } else {
     VOICE_NOTES[0] = manual_DCO_calibration_start_note;
     DCO_calibration_current_note = manual_DCO_calibration_start_note;
-    ampCompCalibrationVal = initManualAmpCompCalibrationValPreset + manualCalibrationOffset[currentDCO];
+    ampCompCalibrationVal = initManualAmpCompCalibrationValPreset +
+                            manualCalibrationOffset[currentDCO];
   }
 
   float freqHz = note_to_freq(DCO_calibration_current_note);
 
-  // 4. Drive target oscillator (automatically calls flush_voice_pwm())
   autotune_drive_core(currentDCO, freqHz, ampCompCalibrationVal);
 
   if (stageChanged) {
-    delay(100); 
+    delay(100);
   }
 
-  // Stream live gap telemetry to UI / Screen
   DCO_calibration_debug();
 
   if (pwCvProbeRequested) {
@@ -140,6 +134,7 @@ void autotune_manual_task() {
     run_pw_cv_probe();
   }
 }
+
   
 // -----------------------------------------------------------------------------
 // 3. Main Entry Point: Called repeatedly from loop1()

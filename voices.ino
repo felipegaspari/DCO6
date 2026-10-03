@@ -447,6 +447,559 @@ uint32_t get_osc_clk_div(uint8_t osc, float freqHz) {
   return clk_div;
 }
 
+//===================================================================================================
+// TRIANGLE WAVEFORM BAKING FUNCTIONS
+//===================================================================================================
+
+#define STATE_UP   1  // Pin HIGH -> DG411 Switch Open (Ramp Up)
+#define STATE_DOWN 0  // Pin LOW -> DG411 Switch Closed (Ramp Down)
+#define PIO_OVERHEAD 4 // pull(1) + out_pins(1) + out_y(1) + jmp(1) = 4 cycles
+
+//int32_t symmetry_trim = (int32_t)test1; 
+
+static inline uint32_t pack_segment(uint32_t state, uint32_t cycles) {
+    if (cycles < PIO_OVERHEAD) cycles = PIO_OVERHEAD; // Minimum is 4 cycles
+    uint32_t y_val = cycles - PIO_OVERHEAD;
+    
+    // PIO 'out' shifts RIGHT. Bit 0 holds state, remaining bits hold Y.
+    return (y_val << 1) | (state & 1);
+}
+
+// Greatest odd integer <= x. x is Q8. Used to pick the fold band's slope.
+static inline int fold_left_odd(int32_t x_q8) {
+    int32_t floor_x;
+    if (x_q8 >= 0) {
+        floor_x = x_q8 >> 8;
+    } else {
+        floor_x = -(((-x_q8) + 255) >> 8);
+    }
+    if (floor_x & 1) return (int)floor_x;
+    return (int)floor_x - 1;
+}
+
+// Serial fold into ±1. Slope is constant between odd integers:
+// left-odd % 4 == 3 ramps up as the input rises, == 1 ramps down.
+static inline uint8_t fold_dir_from_left_odd(int left) {
+    int m = left % 4;
+    if (m < 0) m += 4;
+    return (m == 3) ? (uint8_t)STATE_UP : (uint8_t)STATE_DOWN;
+}
+
+// |test2| folds whichever test4 carrier is selected.
+// Slider is param 251, -4096..4096. Negative mirrors positive:
+//   |test2| 0..4096 maps g linearly from 1.0 to 3.0.
+// |test5| 0..5 picks the transfer. All styles start the walk at -x_off
+// so g = 1 matches the unfolded carrier:
+//   0 serial odd (±1,±3,±5,±7)
+//   1 even integers (±2,±4,±6)
+//   2 positive-only (odd k, x_hit > 0)
+//   3 negative-only (odd k, x_hit < 0)
+//   4 late / skip-inner (|k|>=3, q = (2g-1)·x/x_peak)
+//   5 bias (q += (g-1)/2)
+// Hairpins shorter than ~100 us become an 8-pair chamfer.
+static void wave_emit(WaveSeg* seg, int* n, uint8_t dir, uint32_t cycles) {
+    if (cycles == 0 || *n >= DCO_WAVE_SLOTS) return;
+    if (*n > 0 && seg[*n - 1].dir == dir) {
+        seg[*n - 1].cycles += cycles;
+        return;
+    }
+    seg[*n].dir = dir;
+    seg[*n].cycles = cycles;
+    (*n)++;
+}
+
+static void wave_emit_pair(WaveSeg* seg, int* n, uint32_t pair_len, uint32_t up_q8) {
+    if (up_q8 > 256) up_q8 = 256;
+    uint32_t up = (uint32_t)(((uint64_t)pair_len * up_q8) >> 8);
+    uint32_t dn = pair_len - up;
+    if (up > 0 && up < PIO_OVERHEAD) { dn += up; up = 0; }
+    if (dn > 0 && dn < PIO_OVERHEAD) { up += dn; dn = 0; }
+    wave_emit(seg, n, STATE_UP, up);
+    wave_emit(seg, n, STATE_DOWN, dn);
+}
+
+static void wave_seal(WaveSeg* seg, int n, uint32_t t_up, uint32_t t_down) {
+    uint32_t up = 0;
+    uint32_t dn = 0;
+    int last_up = -1;
+    int last_dn = -1;
+    for (int i = 0; i < n; i++) {
+        if (seg[i].dir == STATE_UP) {
+            up += seg[i].cycles;
+            last_up = i;
+        } else {
+            dn += seg[i].cycles;
+            last_dn = i;
+        }
+    }
+    if (last_up >= 0 && up != t_up) {
+        const int32_t c = (int32_t)seg[last_up].cycles + ((int32_t)t_up - (int32_t)up);
+        if (c >= (int32_t)PIO_OVERHEAD) seg[last_up].cycles = (uint32_t)c;
+    }
+    if (last_dn >= 0 && dn != t_down) {
+        const int32_t c = (int32_t)seg[last_dn].cycles + ((int32_t)t_down - (int32_t)dn);
+        if (c >= (int32_t)PIO_OVERHEAD) seg[last_dn].cycles = (uint32_t)c;
+    }
+}
+
+static void wave_absorb_shorts(WaveSeg* seg, int* n) {
+    for (int guard = 0; guard < DCO_WAVE_SLOTS; guard++) {
+        int short_i = -1;
+        for (int i = 0; i < *n; i++) {
+            if (seg[i].cycles > 0 && seg[i].cycles < PIO_OVERHEAD) {
+                short_i = i;
+                break;
+            }
+        }
+        if (short_i < 0) break;
+        int host = -1;
+        for (int j = *n - 1; j >= 0; --j) {
+            if (j == short_i || seg[j].dir != seg[short_i].dir || seg[j].cycles == 0) continue;
+            host = j;
+            break;
+        }
+        if (host < 0) break;
+        seg[host].cycles += seg[short_i].cycles;
+        for (int j = short_i + 1; j < *n; j++) seg[j - 1] = seg[j];
+        (*n)--;
+    }
+}
+
+static int bake_base_shape(WaveSeg* seg, uint8_t shape, uint32_t t_up, uint32_t t_down) {
+    int n = 0;
+    uint32_t up_accum = 0;
+    uint32_t dn_accum = 0;
+
+    if (shape == 0) {
+        wave_emit(seg, &n, STATE_UP, t_up);
+        wave_emit(seg, &n, STATE_DOWN, t_down);
+    } else if (shape == 1) {
+        const uint32_t up_50 = (t_up * 50) / 100;
+        const uint32_t up_25 = (t_up * 25) / 100;
+        const uint32_t up_rem = t_up - (up_50 + up_25);
+        const uint32_t dn_50 = (t_down * 50) / 100;
+        const uint32_t dn_25 = (t_down * 25) / 100;
+        const uint32_t dn_rem = t_down - (dn_50 + dn_25);
+        wave_emit(seg, &n, STATE_UP,   up_50);
+        wave_emit(seg, &n, STATE_DOWN, dn_25);
+        wave_emit(seg, &n, STATE_UP,   up_25 + up_rem);
+        wave_emit(seg, &n, STATE_DOWN, dn_50);
+        wave_emit(seg, &n, STATE_UP,   up_25);
+        wave_emit(seg, &n, STATE_DOWN, dn_25 + dn_rem);
+    } else if (shape == 2) {
+        const uint32_t up_fast = (t_up * 4) / 100;
+        const uint32_t dn_fast = (t_down * 4) / 100;
+        for (int j = 0; j < 7; j++) {
+            wave_emit(seg, &n, STATE_UP,   up_fast); up_accum += up_fast;
+            wave_emit(seg, &n, STATE_DOWN, dn_fast); dn_accum += dn_fast;
+        }
+        wave_emit(seg, &n, STATE_UP,   t_up - up_accum);
+        wave_emit(seg, &n, STATE_DOWN, t_down - dn_accum);
+    } else if (shape == 3) {
+        const uint32_t up_big = (t_up * 22) / 100;
+        const uint32_t dn_sml = (t_down * 5) / 100;
+        for (int j = 0; j < 4; j++) {
+            wave_emit(seg, &n, STATE_UP,   up_big); up_accum += up_big;
+            wave_emit(seg, &n, STATE_DOWN, dn_sml); dn_accum += dn_sml;
+        }
+        const uint32_t up_sml = (t_up * 3) / 100;
+        const uint32_t dn_big = (t_down * 20) / 100;
+        for (int j = 0; j < 3; j++) {
+            wave_emit(seg, &n, STATE_UP,   up_sml); up_accum += up_sml;
+            wave_emit(seg, &n, STATE_DOWN, dn_big); dn_accum += dn_big;
+        }
+        wave_emit(seg, &n, STATE_UP,   t_up - up_accum);
+        wave_emit(seg, &n, STATE_DOWN, t_down - dn_accum);
+    } else if (shape == 4) {
+        const uint32_t u1 = (t_up * 35) / 100;   const uint32_t d1 = (t_down * 2) / 100;
+        const uint32_t u2 = (t_up * 2) / 100;    const uint32_t d2 = (t_down * 9) / 100;
+        const uint32_t u3 = (t_up * 13) / 100;   const uint32_t d3 = (t_down * 2) / 100;
+        const uint32_t u4 = (t_up * 35) / 100;   const uint32_t d4 = (t_down * 2) / 100;
+        const uint32_t u5 = (t_up * 2) / 100;    const uint32_t d5 = (t_down * 35) / 100;
+        const uint32_t u6 = (t_up * 9) / 100;    const uint32_t d6 = (t_down * 2) / 100;
+        const uint32_t u7 = (t_up * 2) / 100;    const uint32_t d7 = (t_down * 13) / 100;
+        wave_emit(seg, &n, STATE_UP,   u1); up_accum += u1;  wave_emit(seg, &n, STATE_DOWN, d1); dn_accum += d1;
+        wave_emit(seg, &n, STATE_UP,   u2); up_accum += u2;  wave_emit(seg, &n, STATE_DOWN, d2); dn_accum += d2;
+        wave_emit(seg, &n, STATE_UP,   u3); up_accum += u3;  wave_emit(seg, &n, STATE_DOWN, d3); dn_accum += d3;
+        wave_emit(seg, &n, STATE_UP,   u4); up_accum += u4;  wave_emit(seg, &n, STATE_DOWN, d4); dn_accum += d4;
+        wave_emit(seg, &n, STATE_UP,   u5); up_accum += u5;  wave_emit(seg, &n, STATE_DOWN, d5); dn_accum += d5;
+        wave_emit(seg, &n, STATE_UP,   u6); up_accum += u6;  wave_emit(seg, &n, STATE_DOWN, d6); dn_accum += d6;
+        wave_emit(seg, &n, STATE_UP,   u7); up_accum += u7;  wave_emit(seg, &n, STATE_DOWN, d7); dn_accum += d7;
+        wave_emit(seg, &n, STATE_UP,   t_up - up_accum);
+        wave_emit(seg, &n, STATE_DOWN, t_down - dn_accum);
+    } else {
+        const uint32_t min_t = PIO_OVERHEAD;
+        const uint32_t u_unit = (t_up - (3 * min_t)) / 6;
+        const uint32_t d_unit = (t_down - (2 * min_t)) / 6;
+        wave_emit(seg, &n, STATE_UP,   u_unit); up_accum += u_unit;
+        wave_emit(seg, &n, STATE_DOWN, min_t);  dn_accum += min_t;
+        wave_emit(seg, &n, STATE_UP,   u_unit); up_accum += u_unit;
+        wave_emit(seg, &n, STATE_DOWN, d_unit); dn_accum += d_unit;
+        wave_emit(seg, &n, STATE_UP,   u_unit); up_accum += u_unit;
+        wave_emit(seg, &n, STATE_DOWN, d_unit); dn_accum += d_unit;
+        wave_emit(seg, &n, STATE_UP,   min_t);  up_accum += min_t;
+        wave_emit(seg, &n, STATE_DOWN, d_unit); dn_accum += d_unit;
+        wave_emit(seg, &n, STATE_UP,   min_t);  up_accum += min_t;
+        wave_emit(seg, &n, STATE_DOWN, d_unit); dn_accum += d_unit;
+        wave_emit(seg, &n, STATE_UP,   min_t);  up_accum += min_t;
+        wave_emit(seg, &n, STATE_DOWN, d_unit); dn_accum += d_unit;
+        wave_emit(seg, &n, STATE_UP,   u_unit); up_accum += u_unit;
+        wave_emit(seg, &n, STATE_DOWN, d_unit); dn_accum += d_unit;
+        wave_emit(seg, &n, STATE_UP,   t_up - up_accum);
+        wave_emit(seg, &n, STATE_DOWN, t_down - dn_accum);
+    }
+    wave_seal(seg, n, t_up, t_down);
+    return n;
+}
+
+static int32_t fold_gain_q8(int32_t g_q8, uint8_t mode) {
+    return (mode == 4) ? (2 * g_q8 - 256) : g_q8;
+}
+
+static int32_t fold_bias_q8(int32_t g_q8, uint8_t mode) {
+    return (mode == 5) ? ((g_q8 - 256) / 2) : 0;
+}
+
+// RANGE multiplier so each style's RMS matches serial (mode 0) at the same g.
+// Identity (g=1) is always 256. Never scale below identity.
+static uint32_t fold_amp_comp_q8(uint32_t g_q8, uint8_t mode) {
+    uint32_t s;
+    switch (mode) {
+        case 1:
+            s = (g_q8 <= 512u) ? 256u : (g_q8 >> 1);
+            break;
+        case 2:
+        case 3: {
+            const float g = (float)g_q8 * (1.0f / 256.0f);
+            const float sc = g * sqrtf(2.0f / (g * g + 1.0f));
+            s = (uint32_t)(sc * 256.0f + 0.5f);
+            break;
+        }
+        case 4:
+            s = (g_q8 <= 512u) ? 256u : (2u * g_q8 - 256u) / 3u;
+            break;
+        case 5: {
+            const float g = (float)g_q8 * (1.0f / 256.0f);
+            const float gp = (3.0f * g - 1.0f) * 0.5f;
+            const float gn = (g + 1.0f) * 0.5f;
+            const float sc = sqrtf(2.0f) * gp * gn / sqrtf(gp * gp + gn * gn);
+            s = (uint32_t)(sc * 256.0f + 0.5f);
+            break;
+        }
+        default:
+            s = g_q8;
+            break;
+    }
+    if (s < 256u) s = 256u;
+    return s;
+}
+
+static int32_t fold_q_from_x(int32_t x, int32_t g_q8, int32_t x_peak, uint8_t mode) {
+    const int32_t gain = fold_gain_q8(g_q8, mode);
+    int32_t q = (int32_t)(((int64_t)gain * x) / x_peak);
+    q += fold_bias_q8(g_q8, mode);
+    return q;
+}
+
+static int32_t fold_x_from_q(int32_t tq, int32_t g_q8, int32_t x_peak, uint8_t mode) {
+    const int32_t gain = fold_gain_q8(g_q8, mode);
+    if (gain == 0) return 0;
+    const int32_t q_unbiased = tq - fold_bias_q8(g_q8, mode);
+    return (int32_t)(((int64_t)q_unbiased * x_peak) / gain);
+}
+
+static int fold_push_split(uint32_t* splits, int ns, uint32_t t, uint32_t C) {
+    if (t == 0 || t >= C || ns >= 8) return ns;
+    for (int i = 0; i < ns; i++) if (splits[i] == t) return ns;
+    splits[ns] = t;
+    return ns + 1;
+}
+
+static uint32_t fold_t_at_x(int32_t x0, int32_t x1, int32_t x_hit) {
+    return (x1 > x0) ? (uint32_t)(x_hit - x0) : (uint32_t)(x0 - x_hit);
+}
+
+static int fold_x_in_open(int32_t x0, int32_t x1, int32_t xh) {
+    if (x1 > x0) return (x0 < xh && xh < x1);
+    return (x1 < xh && xh < x0);
+}
+
+static int fold_collect_splits(int32_t x0, int32_t x1, uint32_t C, int32_t g_q8, int32_t x_peak, uint8_t mode, uint32_t* splits) {
+    if (mode == 2 && x0 <= 0 && x1 <= 0) return 0;
+    if (mode == 3 && x0 >= 0 && x1 >= 0) return 0;
+
+    const int32_t q0 = fold_q_from_x(x0, g_q8, x_peak, mode);
+    const int32_t q1 = fold_q_from_x(x1, g_q8, x_peak, mode);
+    const int k0 = (mode == 1) ? -6 : -7;
+    const int k1 = (mode == 1) ? 6 : 7;
+    int ns = 0;
+    for (int k = k0; k <= k1; k += 2) {
+        if (mode == 1 && k == 0) continue;
+        if (mode == 4 && (k == 1 || k == -1)) continue;
+        const int32_t tq = (int32_t)k << 8;
+        const bool cross = (q0 < tq && tq < q1) || (q1 < tq && tq < q0);
+        if (!cross) continue;
+        const int32_t x_hit = fold_x_from_q(tq, g_q8, x_peak, mode);
+        if (mode == 2 && x_hit <= 0) continue;
+        if (mode == 3 && x_hit >= 0) continue;
+        if (!fold_x_in_open(x0, x1, x_hit)) continue;
+        ns = fold_push_split(splits, ns, fold_t_at_x(x0, x1, x_hit), C);
+        if (ns >= 8) break;
+    }
+    for (int i = 1; i < ns; i++) {
+        uint32_t v = splits[i];
+        int j = i;
+        while (j > 0 && splits[j - 1] > v) { splits[j] = splits[j - 1]; j--; }
+        splits[j] = v;
+    }
+    return ns;
+}
+
+static int fold_carrier(const WaveSeg* base, int nb, int32_t g_q8, uint8_t mode, WaveSeg* out) {
+    int32_t x = 0;
+    int32_t xmin = 0;
+    int32_t xmax = 0;
+    for (int i = 0; i < nb; i++) {
+        if (base[i].dir == STATE_UP) x += (int32_t)base[i].cycles;
+        else x -= (int32_t)base[i].cycles;
+        if (x < xmin) xmin = x;
+        if (x > xmax) xmax = x;
+    }
+    const int32_t x_off = (xmin + xmax) / 2;
+    int32_t x_peak = xmax - x_off;
+    if (x_off - xmin > x_peak) x_peak = x_off - xmin;
+    if (x_peak < 1) return 0;
+
+    x = -x_off;
+    int n = 0;
+    for (int i = 0; i < nb; i++) {
+        const uint32_t C = base[i].cycles;
+        if (C == 0) continue;
+        const int32_t dx = (base[i].dir == STATE_UP) ? (int32_t)C : -(int32_t)C;
+        const int32_t x1 = x + dx;
+        uint32_t splits[8];
+        const int ns = fold_collect_splits(x, x1, C, g_q8, x_peak, mode, splits);
+        uint32_t t0 = 0;
+        for (int s = 0; s <= ns; s++) {
+            const uint32_t t1 = (s == ns) ? C : splits[s];
+            const uint32_t piece = t1 - t0;
+            if (piece == 0) { t0 = t1; continue; }
+            const int32_t x_mid = x + ((dx > 0) ? (int32_t)(t0 + piece / 2) : -(int32_t)(t0 + piece / 2));
+            int32_t q_mid = fold_q_from_x(x_mid, g_q8, x_peak, mode);
+            // Skip-inner: |q|<3 stays identity; map |q|>=3 onto serial's first folded bands.
+            if (mode == 4) {
+                if (q_mid >= 768) q_mid -= 512;
+                else if (q_mid <= -768) q_mid += 512;
+            }
+            const uint8_t fold_slope = fold_dir_from_left_odd(fold_left_odd(q_mid));
+            const uint8_t out_dir = (fold_slope == base[i].dir) ? (uint8_t)STATE_UP : (uint8_t)STATE_DOWN;
+            wave_emit(out, &n, out_dir, piece);
+            t0 = t1;
+        }
+        x = x1;
+    }
+    wave_absorb_shorts(out, &n);
+    return n;
+}
+
+static void chamfer_emit_window(WaveSeg* out, int* n, uint32_t W, uint32_t depth_q8, uint8_t arrive_dir) {
+    const uint32_t pair_len = W / 8;
+    if (pair_len < PIO_OVERHEAD) {
+        wave_emit(out, n, arrive_dir, W);
+        return;
+    }
+    static const uint16_t tent_arrive[4] = {32, 96, 160, 224};
+    static const uint16_t tent_leave[4] = {224, 160, 96, 32};
+    for (int j = 0; j < 4; j++) {
+        const uint32_t lean = (depth_q8 * tent_arrive[j]) >> 8;
+        const uint32_t up = (arrive_dir == STATE_UP) ? (256 - lean) : lean;
+        wave_emit_pair(out, n, pair_len, up);
+    }
+    for (int j = 0; j < 4; j++) {
+        const uint32_t lean = (depth_q8 * tent_leave[j]) >> 8;
+        const uint32_t up = (arrive_dir == STATE_UP) ? lean : (256 - lean);
+        wave_emit_pair(out, n, pair_len, up);
+    }
+}
+
+static int chamfer_hairpins(WaveSeg* seg, int n, uint32_t t_corner, uint32_t period) {
+    if (n < 4 || t_corner < 32) return n;
+    uint32_t w_cap = period / 4;
+    if (w_cap < t_corner) t_corner = w_cap;
+
+    for (int pass = 0; pass < 8; pass++) {
+        int hit = -1;
+        int left = -1;
+        int right = -1;
+        for (int i = 0; i < n - 1; i++) {
+            if (seg[i].dir == seg[i + 1].dir) continue;
+            if (seg[i].cycles >= t_corner || seg[i + 1].cycles >= t_corner) continue;
+            const int l = (i == 0) ? (n - 1) : (i - 1);
+            const int r = (i + 1 == n - 1) ? 0 : (i + 2);
+            if (l == i || l == i + 1 || r == i || r == i + 1 || l == r) continue;
+            if (l > i || r < i) continue;
+            hit = i;
+            left = l;
+            right = r;
+            break;
+        }
+        if (hit < 0) break;
+        const uint32_t h = seg[hit].cycles + seg[hit + 1].cycles;
+        uint32_t W = t_corner;
+        if (W < h) W = h;
+        uint32_t extra = W - h;
+        uint32_t take_l = extra / 2;
+        uint32_t take_r = extra - take_l;
+        if (seg[left].cycles < take_l + PIO_OVERHEAD) take_l = (seg[left].cycles > PIO_OVERHEAD) ? (seg[left].cycles - PIO_OVERHEAD) : 0;
+        if (seg[right].cycles < take_r + PIO_OVERHEAD) take_r = (seg[right].cycles > PIO_OVERHEAD) ? (seg[right].cycles - PIO_OVERHEAD) : 0;
+        W = h + take_l + take_r;
+        if (W / 8 < PIO_OVERHEAD) break;
+        W = (W / 8) * 8;
+        extra = W - h;
+        take_l = extra / 2;
+        take_r = extra - take_l;
+        if (seg[left].cycles < take_l + PIO_OVERHEAD || seg[right].cycles < take_r + PIO_OVERHEAD) break;
+
+        uint32_t depth_q8 = (uint32_t)(((uint64_t)h << 8) / t_corner);
+        if (depth_q8 > 256) depth_q8 = 256;
+        const uint8_t arrive_dir = seg[left].dir;
+
+        WaveSeg tmp[DCO_WAVE_SLOTS];
+        int m = 0;
+        for (int i = 0; i < left; i++) wave_emit(tmp, &m, seg[i].dir, seg[i].cycles);
+        wave_emit(tmp, &m, seg[left].dir, seg[left].cycles - take_l);
+        chamfer_emit_window(tmp, &m, W, depth_q8, arrive_dir);
+        wave_emit(tmp, &m, seg[right].dir, seg[right].cycles - take_r);
+        for (int i = right + 1; i < n; i++) wave_emit(tmp, &m, seg[i].dir, seg[i].cycles);
+        if (m < 2 || m > DCO_WAVE_SLOTS) break;
+        n = m;
+        for (int i = 0; i < n; i++) seg[i] = tmp[i];
+    }
+    return n;
+}
+
+static uint16_t pack_wave(uint32_t* buf, const WaveSeg* seg, int n) {
+    WaveSeg tmp[DCO_WAVE_SLOTS];
+    if (n < 2) n = 2;
+    if (n > DCO_WAVE_SLOTS) n = DCO_WAVE_SLOTS;
+    for (int i = 0; i < n; i++) tmp[i] = seg[i];
+    while (n < DCO_WAVE_SLOTS) {
+        int best = -1;
+        uint32_t best_c = 0;
+        for (int i = 0; i < n; i++) {
+            if (tmp[i].cycles >= (uint32_t)(2 * PIO_OVERHEAD) && tmp[i].cycles > best_c) {
+                best = i;
+                best_c = tmp[i].cycles;
+            }
+        }
+        if (best < 0) break;
+        const uint32_t keep = tmp[best].cycles >> 1;
+        const uint32_t rest = tmp[best].cycles - keep;
+        for (int j = n; j > best; --j) tmp[j] = tmp[j - 1];
+        tmp[best].cycles = keep;
+        tmp[best + 1].cycles = rest;
+        tmp[best + 1].dir = tmp[best].dir;
+        n++;
+    }
+    for (int i = 0; i < n; i++) buf[i] = pack_segment(tmp[i].dir, tmp[i].cycles);
+    return (uint16_t)n;
+}
+
+static uint8_t dco_last_shape[NUM_VOICES_TOTAL];
+static int16_t dco_last_fold[NUM_VOICES_TOTAL];
+static int16_t dco_last_trim[NUM_VOICES_TOTAL];
+static uint8_t dco_last_mode[NUM_VOICES_TOTAL];
+static uint8_t dco_last_valid[NUM_VOICES_TOTAL];
+static uint8_t dco_pong_copies[NUM_VOICES_TOTAL];
+static uint8_t dco_pong_last_idle[NUM_VOICES_TOTAL] = { 0xFF, 0xFF, 0xFF, 0xFF };
+
+void dco_wave_invalidate_bake(uint8_t voice) {
+    if (voice < NUM_VOICES_TOTAL) {
+        dco_last_valid[voice] = 0;
+        dco_pong_copies[voice] = 0;
+        dco_pong_last_idle[voice] = 0xFF;
+    }
+}
+
+static void dco_note_pong_commit(uint8_t voice, uint8_t shape, int16_t fold, int16_t trim_key, uint8_t mode, int idle) {
+    const bool same = (dco_last_shape[voice] == shape && dco_last_fold[voice] == fold && dco_last_trim[voice] == trim_key && dco_last_mode[voice] == mode);
+    if (!same || dco_pong_last_idle[voice] == 0xFF) {
+        dco_pong_copies[voice] = 1;
+    } else if (dco_pong_last_idle[voice] != (uint8_t)idle) {
+        dco_pong_copies[voice] = 2;
+    } else {
+        dco_pong_copies[voice] = 1;
+    }
+    dco_pong_last_idle[voice] = (uint8_t)idle;
+    dco_last_shape[voice] = shape;
+    dco_last_fold[voice] = fold;
+    dco_last_trim[voice] = trim_key;
+    dco_last_mode[voice] = mode;
+    dco_last_valid[voice] = (dco_pong_copies[voice] >= 2) ? 1 : 0;
+}
+
+static inline void bake_waveform(uint8_t voice, uint8_t shape, uint32_t period_cycles) {
+    dco_wave_set_clkdiv(voice, period_cycles);
+    if (period_cycles < 64) return;
+    if (shape > 5) shape = 5;
+
+    int32_t mag = test2;
+    if (mag < 0) mag = -mag;
+    if (mag > 4096) mag = 4096;
+    const int16_t fold = (int16_t)mag;
+    const int16_t trim_key = test1;
+    int32_t m5 = test5;
+    if (m5 < 0) m5 = -m5;
+    if (m5 > 5) m5 = 5;
+    const uint8_t fold_mode = (uint8_t)m5;
+    if (dco_last_valid[voice] && dco_last_shape[voice] == shape && dco_last_fold[voice] == fold && dco_last_trim[voice] == trim_key && dco_last_mode[voice] == fold_mode) {
+        return;
+    }
+
+    const uint32_t period_native = DCO_WAVE_NATIVE;
+    const int32_t half = (int32_t)(period_native / 2);
+    const int32_t other = (int32_t)period_native - half;
+    int32_t trim = (int32_t)test1 * 100;
+    int32_t lim = half / 4;
+    if (lim < 0) lim = 0;
+    if (trim > lim) trim = lim;
+    if (trim < -lim) trim = -lim;
+    if (trim > other - 1) trim = other - 1;
+    if (trim < -(half - 1)) trim = -(half - 1);
+
+    const uint32_t t_up = (uint32_t)(half + trim);
+    const uint32_t t_down = (uint32_t)(other - trim);
+    if (t_up < PIO_OVERHEAD || t_down < PIO_OVERHEAD) return;
+
+    WaveSeg base[DCO_WAVE_SLOTS];
+    const int nb = bake_base_shape(base, shape, t_up, t_down);
+    if (nb < 2) return;
+
+    uint32_t buf[DCO_WAVE_SLOTS];
+    if (fold > 0) {
+        const int32_t g_q8 = 256 + (int32_t)fold * 512 / 4096;
+        WaveSeg folded[DCO_WAVE_SLOTS];
+        int nf = fold_carrier(base, nb, g_q8, fold_mode, folded);
+        if (nf >= 2) {
+            uint32_t t_corner = (uint32_t)(((uint64_t)(sysClock_Hz / 10000u) * period_native) / period_cycles);
+            if (t_corner < 32) t_corner = 32;
+            nf = chamfer_hairpins(folded, nf, t_corner, period_native);
+            wave_seal(folded, nf, t_up, t_down);
+            const uint16_t nfold = pack_wave(buf, folded, nf);
+            const int idle = dco_wave_commit(voice, buf, nfold);
+            if (idle < 0) return;
+            dco_note_pong_commit(voice, shape, fold, trim_key, fold_mode, idle);
+            return;
+        }
+    }
+
+    const uint16_t nbase = pack_wave(buf, base, nb);
+    const int idle = dco_wave_commit(voice, buf, nbase);
+    if (idle < 0) return;
+    dco_note_pong_commit(voice, shape, fold, trim_key, fold_mode, idle);
+}
+//===================================================================================================
+
 // Dispatch entry point: select float vs fixed-point implementation at compile
 // time.
 void SRAM_HOT(voice_task_main)() {
@@ -570,12 +1123,18 @@ void SRAM_HOT(voice_task_float)() {
   static constexpr float EPS_FLOAT = (float)Q24_ONE_EPS * (1.0f / 16777216.0f);
 
   // 5. Global PWM LFO delta & Base PWM Pre-calculation
+#if PW_SWEEP_MODE_DEFAULT == PW_SWEEP_FULL
+  // DCO4: Bipolar LFO swing
   const int32_t lfo2_pw_delta = ((int32_t)LFO2Level * (int32_t)LFO2toPW) >> 15;
+#else
+  // HALF Modes: Shift bipolar LFO (-32768..+32767) into unipolar positive (0..32767)
+  const int32_t lfo2_pw_delta = ((uint32_t)(LFO2Level + 32768) * (uint32_t)LFO2toPW) >> 15;
+#endif
 
   // Character Engine Output
-  const float char_pitch_delta_f = char_pitch_scale_q15 ? character_pitch_delta_float() : 0.0f;
-  const int32_t char_pw_delta_i = (int32_t)character_pw_delta();
-  const int32_t char_amp_mod_factor  = char_amp_scale_q15   ? character_amp_delta()         : 0;
+  const float char_pitch_delta_f =  character ? character_pitch_delta_float() : 0.0f;
+  const int32_t char_pw_delta_i = character ? (int32_t)character_pw_delta() : 0;
+  const int32_t char_amp_mod_factor  = character ? character_amp_delta() : 0;
 
   // Hoist loop-invariant additions out of the voice loop
   const float global_mods = calcPitchbend + EPS_FLOAT + char_pitch_delta_f + masterTuning_local;
@@ -848,10 +1407,19 @@ void SRAM_HOT(voice_task_float)() {
     
     uint32_t wA, kA, wB, kB;
     get_osc_params(DCO_A, wA, kA);
-    get_osc_params(DCO_B, wB, kB);
+    //get_osc_params(DCO_B, wB, kB);
     
     uint32_t clk_div1 = pio_clk_div_for_y(total_cycles1, osc_last_y[DCO_A], wA, kA);
-    uint32_t clk_div2 = pio_clk_div_for_y(total_cycles2, osc_last_y[DCO_B], wB, kB);
+    //uint32_t clk_div2 = pio_clk_div_for_y(total_cycles2, osc_last_y[DCO_B], wB, kB);
+
+        // OSC B: |test2| 0..4096 folds the test4 shape (g = 1..3).
+        // |test5| 0..5 selects the fold transfer. test2 == 0 keeps the
+        // discrete shape; negative test2/test5 mirror positive.
+    int16_t shapeB = test4;
+    if (shapeB < 0) shapeB = 0;
+    if (shapeB > 5) shapeB = 5;
+    bake_waveform(i, (uint8_t)shapeB, total_cycles2);
+
     BENCH_END(vt_clk_div);
 
     // Prep variables for retrig 
@@ -912,7 +1480,19 @@ const int32_t char_val_B = character_clamp_amp((int32_t)chanLevel2 + amp_j_B);
 // The compiler translates this into an ARM "IT" (If-Then) block and a "MOV" instruction.
 // There is NO branch, NO pipeline flush, and execution time is 100% deterministic (zero jitter).
 RANGE_PWM[DCO_A] = character ? char_val_A : chanLevel;
-RANGE_PWM[DCO_B] = character ? char_val_B : chanLevel2;
+    // Fold shortens analog climb; scale OSC B RANGE so each style's RMS
+    // matches serial (mode 0) at the same g. Identity stays *1.
+    int32_t fold_mag = test2;
+    if (fold_mag < 0) fold_mag = -fold_mag;
+    if (fold_mag > 4096) fold_mag = 4096;
+    const uint32_t g_q8 = 256u + (uint32_t)fold_mag * 512u / 4096u;
+    int32_t m5 = test5;
+    if (m5 < 0) m5 = -m5;
+    if (m5 > 5) m5 = 5;
+    uint32_t range_b = (uint32_t)(character ? char_val_B : chanLevel2);
+    range_b = (range_b * fold_amp_comp_q8(g_q8, (uint8_t)m5)) >> 8;
+    if (range_b > DIV_COUNTER) range_b = DIV_COUNTER;
+    RANGE_PWM[DCO_B] = (uint16_t)range_b;
     BENCH_END(vt_range_pwm);
 
     PIO pioN_A = pio[VOICE_TO_PIO[DCO_A]];
@@ -921,101 +1501,127 @@ RANGE_PWM[DCO_B] = character ? char_val_B : chanLevel2;
     uint8_t sm2N = VOICE_TO_SM[DCO_B];
 
     if (is_note_on) {
-        BENCH_BEGIN(vt_retrig_sm_apply);
-        if (oscPhaseSync >= 1) {
-            // Phase sync mode: Hard phase reset
-            if (note_retrig_mode != NOTE_RETRIG_SYNC_JMP) {
-                uint32_t maskAB = (1u << sm1N) | (1u << sm2N);
-                pio_set_sm_mask_enabled(pioN_A, maskAB, false);
+      BENCH_BEGIN(vt_retrig_sm_apply);
+      if (oscPhaseSync >= 1) {
+          // Phase sync mode: Hard phase reset
+          if (note_retrig_mode != NOTE_RETRIG_SYNC_JMP) {
+              // OSC A: Standard single-SM mask (OSC B is restarted via DMA helper)
+              uint32_t maskA = (1u << sm1N);
+              // uint32_t maskAB = (1u << sm1N) | (1u << sm2N);
+              pio_set_sm_mask_enabled(pioN_A, maskA, false);
 
-                osc_load_periods_stopped_noclear(DCO_A, retrig_p1.y, retrig_p1.clk_div,
-                                                 DCO_B, retrig_p2.y, retrig_p2.clk_div);
+              // OSC A: Load stopped period (single-oscillator variant)
+              osc_load_period_stopped_noclear(DCO_A, retrig_p1.y, retrig_p1.clk_div);
+              // osc_load_periods_stopped_noclear(DCO_A, retrig_p1.y, retrig_p1.clk_div,
+              //                                  DCO_B, retrig_p2.y, retrig_p2.clk_div);
 
-                pio_sm_exec(pioN_A, sm1N, pio_encode_jmp(osc_restart_target(DCO_A)));
+              pio_sm_exec(pioN_A, sm1N, pio_encode_jmp(osc_restart_target(DCO_A)));
 
-                if (phaseHoldX != 0) {
-                    osc_phase_align_hold_stopped(DCO_B, phaseHoldX);
-                } else {
-                    pio_sm_exec(pioN_B, sm2N, pio_encode_jmp(osc_restart_target(DCO_B)));
-                }
+              // OSC B (Triangle Core): Hard phase reset for the DMA Streamer
+              reset_dco_dma_phase(i, pioN_B, sm2N, VOICE_TO_PIO[DCO_B]);
 
-                pio_enable_sm_mask_in_sync(pioN_A, maskAB);
-            } else {
-                pio_sm_put(pioN_A, sm1N, clk_div1);
-                pio_sm_put(pioN_B, sm2N, clk_div2);
-                pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
-                pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true));
-                pio_sm_exec(pioN_A, sm1N, pio_encode_jmp(osc_restart_target(DCO_A)));
-                pio_sm_exec(pioN_B, sm2N, pio_encode_jmp(osc_restart_target(DCO_B)));
-                osc_last_clk_div[DCO_A] = clk_div1;
-                osc_last_clk_div[DCO_B] = clk_div2;
-            }
-        } else {
-            // =================================================================
-            // FREE-RUNNING OSCILLATORS (oscPhaseSync == 0):
-            // Pull new divider AND force X to take it immediately!
-            // This shortens the current ramp to the new note instantly without
-            // forcing a hard phase restart.
-            // =================================================================
-          #if defined(UPDATE_CLK_DIV_INSTANTLY)
-            update_osc_clk_div_instantly(pioN_A, sm1N, DCO_A, clk_div1);
-            update_osc_clk_div_instantly(pioN_B, sm2N, DCO_B, clk_div2);
-          #else
-            pio_sm_put(pioN_A, sm1N, clk_div1);
-            pio_sm_put(pioN_B, sm2N, clk_div2);
-            pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
-            pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true));
-          #endif
+              /* 
+              // Legacy OSC B phase alignment (handled natively by DMA reset above)
+              if (phaseHoldX != 0) {
+                  osc_phase_align_hold_stopped(DCO_B, phaseHoldX);
+              } else {
+                  pio_sm_exec(pioN_B, sm2N, pio_encode_jmp(osc_restart_target(DCO_B)));
+              }
+              */
 
-            // // Fallback for when the above doesn't work:
-            // pio_sm_put(pioN_A, sm1N, clk_div1);
-            // pio_sm_put(pioN_B, sm2N, clk_div2);
-            // pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
-            // pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true)); 
-            // // instant note change:
-            // pio_sm_exec(pioN_A, sm1N, pio_encode_mov(pio_x, pio_osr));
-            // pio_sm_exec(pioN_B, sm1N, pio_encode_mov(pio_x, pio_osr));
+              pio_enable_sm_mask_in_sync(pioN_A, maskA);
+          } else {
+              pio_sm_put(pioN_A, sm1N, clk_div1);
+              // pio_sm_put(pioN_B, sm2N, clk_div2); // OSC B is fed via DMA!
+              pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
+              // pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true));
+              pio_sm_exec(pioN_A, sm1N, pio_encode_jmp(osc_restart_target(DCO_A)));
+              // pio_sm_exec(pioN_B, sm2N, pio_encode_jmp(osc_restart_target(DCO_B)));
+              osc_last_clk_div[DCO_A] = clk_div1;
+              // osc_last_clk_div[DCO_B] = clk_div2;
 
-            osc_last_clk_div[DCO_A] = clk_div1;
-            osc_last_clk_div[DCO_B] = clk_div2;
-        }
-        BENCH_END(vt_retrig_sm_apply);
+              // Reset OSC B DMA phase on JMP retrig
+              reset_dco_dma_phase(i, pioN_B, sm2N, VOICE_TO_PIO[DCO_B]);
+          }
+      } else {
+          // =================================================================
+          // FREE-RUNNING OSCILLATORS (oscPhaseSync == 0):
+          // Pull new divider AND force X to take it immediately!
+          // This shortens the current ramp to the new note instantly without
+          // forcing a hard phase restart.
+          // =================================================================
+        #if defined(UPDATE_CLK_DIV_INSTANTLY)
+          update_osc_clk_div_instantly(pioN_A, sm1N, DCO_A, clk_div1);
+          // update_osc_clk_div_instantly(pioN_B, sm2N, DCO_B, clk_div2); // Handled by bake_waveform in RAM
+        #else
+          pio_sm_put(pioN_A, sm1N, clk_div1);
+          // pio_sm_put(pioN_B, sm2N, clk_div2); // Handled by bake_waveform in RAM
+          pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
+          // pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true));
+        #endif
+
+          // // Fallback for when the above doesn't work:
+          // pio_sm_put(pioN_A, sm1N, clk_div1);
+          // pio_sm_put(pioN_B, sm2N, clk_div2);
+          // pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
+          // pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true)); 
+          // // instant note change:
+          // pio_sm_exec(pioN_A, sm1N, pio_encode_mov(pio_x, pio_osr));
+          // pio_sm_exec(pioN_B, sm1N, pio_encode_mov(pio_x, pio_osr));
+
+          osc_last_clk_div[DCO_A] = clk_div1;
+          // osc_last_clk_div[DCO_B] = clk_div2; // OSC B is DMA-driven
+      }
+      BENCH_END(vt_retrig_sm_apply);
 
     } else {
-        // Normal running frame: update clk_div continuously for vibrato/LFOs
-        BENCH_BEGIN(vt_pio_write);
-        #if defined(UPDATE_CLK_DIV_INSTANTLY)
-        update_osc_clk_div_instantly(pioN_A, sm1N, DCO_A, clk_div1);
-        update_osc_clk_div_instantly(pioN_B, sm2N, DCO_B, clk_div2);
-        #else
-        pio_sm_put(pioN_A, sm1N, clk_div1);
-        pio_sm_put(pioN_B, sm2N, clk_div2);
-        pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
-        pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true));
-        #endif
-        osc_last_clk_div[DCO_A] = clk_div1;
-        osc_last_clk_div[DCO_B] = clk_div2;
-        BENCH_END(vt_pio_write);
+      // Normal running frame: update clk_div continuously for vibrato/LFOs
+      BENCH_BEGIN(vt_pio_write);
+      #if defined(UPDATE_CLK_DIV_INSTANTLY)
+      update_osc_clk_div_instantly(pioN_A, sm1N, DCO_A, clk_div1);
+      // update_osc_clk_div_instantly(pioN_B, sm2N, DCO_B, clk_div2); // Handled by bake_waveform() in RAM via DMA
+      #else
+      pio_sm_put(pioN_A, sm1N, clk_div1);
+      // pio_sm_put(pioN_B, sm2N, clk_div2); // OSC B is fed via DMA!
+      pio_sm_exec(pioN_A, sm1N, pio_encode_pull(false, true));
+      // pio_sm_exec(pioN_B, sm2N, pio_encode_pull(false, true));
+      #endif
+      osc_last_clk_div[DCO_A] = clk_div1;
+      // osc_last_clk_div[DCO_B] = clk_div2; // OSC B is DMA-driven
+      BENCH_END(vt_pio_write);
     }
 
     if (timer99microsFlag2) {
       if (pulseWaveOn) {
         BENCH_BEGIN(vt_pwm_calc);
+
+#if PW_SWEEP_MODE_DEFAULT == PW_SWEEP_FULL
         const int32_t adsr3_delta = ((int32_t)adsr3_lvl[i] * (int32_t)ADSR3toPWM) >> 15;
-        // Hoisted base_pw_val eliminates 2 redundant additions per voice
+#else
+        // Shift >> 14 scales the unmodified ADSR3toPWM to the full 2048 span
+        const int32_t adsr3_delta = ((int32_t)adsr3_lvl[i] * (int32_t)ADSR3toPWM) >> 14;
+#endif
+
+        // m_pw is already scaled correctly by the mod matrix - added directly at 1:1
         int32_t pw_calc = base_pw_val + adsr3_delta + (int32_t)m_pw[i];
 
-        // RP2350 OPTIMIZED: Truly Branchless Nested Clamp
-        // Forces GCC to evaluate bounds completely in registers (IT Blocks)
+        // RP2350 OPTIMIZED: Truly Branchless Nested Clamp (0 to 2047)
         const int32_t max_pw = (int32_t)(DIV_COUNTER_PW - 1);
         pw_calc = (pw_calc < 0) ? 0 : ((pw_calc > max_pw) ? max_pw : pw_calc);
 
-        PW_PWM[i] = get_PW_level_interpolated<PW_SWEEP_FULL>((uint16_t)pw_calc, DCO_A, freqA_Hz);
+        // Unified 3-Point Interpolator natively routes the compile flag
+        PW_PWM[i] = get_PW_level_interpolated<PW_SWEEP_MODE_DEFAULT>((uint16_t)pw_calc, DCO_A, freqA_Hz);
+
         BENCH_END(vt_pwm_calc);
       } else {
+#if PW_SWEEP_MODE_DEFAULT == PW_SWEEP_FULL
         PW_PWM[i] = 0;
+#else
+        PW_PWM[i] = DIV_COUNTER_PW; // HALF modes anchor 50% at 0V
+#endif
       }
     }
+    
   } // end loop
 
   BENCH_BEGIN(vt_teardown);

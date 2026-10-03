@@ -1,3 +1,132 @@
+// ========================================================
+// DMA WAVESHAPER PIO (OSC B / Triangle Core)
+// ========================================================
+uint pio_offset_triangle[2];
+
+#define dco_waveshaper_wrap_target 0
+#define dco_waveshaper_wrap 3
+
+static const uint16_t dco_waveshaper_instructions[] = {
+    // .wrap_target
+    0x80a0, //  0: pull   block           ; Wait for next 32-bit DMA segment
+    0x6001, //  1: out    pins, 1         ; Pop Bit 0 (Switch State) directly to pin!
+    0x605f, //  2: out    y, 31           ; Pop Bits 1-31 (Duration) into Y
+    0x0083, //  3: jmp    y--, 3          ; Wait for segment duration
+    // .wrap
+};
+
+static const struct pio_program dco_waveshaper_program = {
+    .instructions = dco_waveshaper_instructions,
+    .length = 4,
+    .origin = -1,
+};
+
+static inline pio_sm_config dco_waveshaper_get_default_config(uint offset) {
+    pio_sm_config c = pio_get_default_sm_config();
+    sm_config_set_wrap(&c, offset + dco_waveshaper_wrap_target, offset + dco_waveshaper_wrap);
+    return c;
+}
+
+void dco_waveshaper_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_sm_config c = dco_waveshaper_get_default_config(offset);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+    sm_config_set_out_pins(&c, pin, 1); 
+    pio_gpio_init(pio, pin);
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+#include "hardware/structs/dma.h"
+
+// --- DMA SETUP ---
+// Two 64-word halves, 512-byte ring. Hardware wraps A then B. No period IRQ.
+uint32_t dco_wave_buffer[NUM_VOICES_TOTAL][2][DCO_WAVE_SLOTS] __attribute__((aligned(512)));
+int dco_dma_chan[NUM_VOICES_TOTAL] = {-1, -1, -1, -1};
+
+static uint32_t dco_pack_seed(uint32_t state, uint32_t cycles) {
+    if (cycles < 4) cycles = 4;
+    return ((cycles - 4) << 1) | (state & 1u);
+}
+
+static void dco_wave_seed(uint voice) {
+    const uint32_t slice = DCO_WAVE_NATIVE / DCO_WAVE_SLOTS;
+    const uint32_t up = dco_pack_seed(1, slice);
+    const uint32_t dn = dco_pack_seed(0, slice);
+    for (int h = 0; h < 2; h++) {
+        for (int i = 0; i < 32; i++) dco_wave_buffer[voice][h][i] = up;
+        for (int i = 32; i < DCO_WAVE_SLOTS; i++) dco_wave_buffer[voice][h][i] = dn;
+    }
+}
+
+void dco_wave_set_clkdiv(uint8_t voice, uint32_t total_cycles) {
+    if (voice >= NUM_VOICES_TOTAL) return;
+    const uint8_t osc = (uint8_t)(voice * 2u + 1u);
+    PIO pio_hw = pio[VOICE_TO_PIO[osc]];
+    const uint sm = VOICE_TO_SM[osc];
+    uint32_t q8 = (uint32_t)(((uint64_t)total_cycles << 8) / DCO_WAVE_NATIVE);
+    if (q8 < 256u) q8 = 256u;
+    const uint16_t div_int = (uint16_t)(q8 >> 8);
+    const uint8_t div_frac = (uint8_t)(q8 & 0xFFu);
+    pio_sm_set_clkdiv_int_frac(pio_hw, sm, div_int, div_frac);
+}
+
+int dco_wave_commit(uint8_t voice, const uint32_t* baked, uint16_t n) {
+    if (voice >= NUM_VOICES_TOTAL || baked == nullptr) return -1;
+    const int chan = dco_dma_chan[voice];
+    if (chan < 0) return -1;
+    if (n > DCO_WAVE_SLOTS) n = DCO_WAVE_SLOTS;
+
+    const uintptr_t base = (uintptr_t)&dco_wave_buffer[voice][0][0];
+    const uintptr_t ra = (uintptr_t)dma_hw->ch[chan].read_addr;
+    const uint32_t idx = ((uint32_t)(ra - base) / 4u) & 127u;
+    const uint32_t pos = idx & 63u;
+    if (pos >= 60u) return -1;
+
+    const int idle = (int)(1u - (idx >> 6));
+    uint32_t* dst = dco_wave_buffer[voice][idle];
+    for (uint16_t i = 0; i < DCO_WAVE_SLOTS; i++) dst[i] = baked[i];
+    return idle;
+}
+
+void init_dco_dma(uint voice, PIO pio, uint sm) {
+    if (dco_dma_chan[voice] == -1) {
+        dco_dma_chan[voice] = dma_claim_unused_channel(true);
+    } else {
+        dma_channel_abort((uint)dco_dma_chan[voice]);
+        dma_channel_set_irq0_enabled((uint)dco_dma_chan[voice], false);
+    }
+    int chan = dco_dma_chan[voice];
+    dma_channel_config c = dma_channel_get_default_config((uint)chan);
+
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_32);
+    channel_config_set_read_increment(&c, true);
+    channel_config_set_write_increment(&c, false);
+    channel_config_set_dreq(&c, pio_get_dreq(pio, sm, true));
+    channel_config_set_ring(&c, false, 9);
+
+    dco_wave_seed(voice);
+    dco_wave_invalidate_bake((uint8_t)voice);
+    dma_channel_configure((uint)chan, &c,
+        &pio->txf[sm],
+        &dco_wave_buffer[voice][0][0],
+        0xFFFFFFFFu,
+        true
+    );
+}
+
+void reset_dco_dma_phase(uint8_t voice, PIO pio, uint sm, uint pio_block_idx) {
+    int chan = dco_dma_chan[voice];
+    pio_sm_set_enabled(pio, sm, false);
+    dma_channel_abort((uint)chan);
+    pio_sm_clear_fifos(pio, sm);
+
+    pio_sm_exec(pio, sm, pio_encode_jmp(pio_offset_triangle[pio_block_idx]));
+
+    dma_channel_set_trans_count((uint)chan, 0xFFFFFFFFu, false);
+    dma_channel_set_read_addr((uint)chan, &dco_wave_buffer[voice][0][0], true);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+
 // Per-voice even/odd pairing (DCO_A = v*2, DCO_B = v*2+1).
 // syncMode 1: B's sideset drives A's reset (A slave, B master).
 // syncMode 2: A's sideset drives B's reset (B slave, A master).
@@ -68,6 +197,7 @@ void init_pio() {
   const uint8_t syncChunks = softSyncChunks > 0 ? softSyncChunks : 1;
   for (int blk = 0; blk < 2; blk++) {
     pio_offset_free[blk] = pio_add_program(pio[blk], &frequency_sync_4_jumps_program);
+    pio_offset_triangle[blk] = pio_add_program(pio[blk], &dco_waveshaper_program);
     pio_loaded_sync_chunks[blk] = 0;
     ensure_soft_sync_program((uint8_t)blk, syncChunks);
   }
@@ -133,16 +263,30 @@ void start_voice_sms() {
 
     pio_sm_clear_fifos(pio[blk], sm);
 
-    if (softSync && i == slave) {
-      frequency_sync_poll_init(pio[blk], sm, pio_offset_sync[blk], RESET_PINS[i], sidesetPin,
-                               RESET_PINS[master], chunks);
-      osc_uses_sync_program[i] = true;
-    } else {
-      frequency_sync_4_jumps(pio[blk], sm, pio_offset_free[blk], RESET_PINS[i], sidesetPin);
-      osc_uses_sync_program[i] = false;
-    }
 
-    osc_load_period_stopped(i, pioPulseLength, osc_last_clk_div[i]);
+    // ==========================================
+    // NEW LOGIC: Odd indices (OSC B) get DMA Waveshaper
+    // ==========================================
+    if (i % 2 != 0) { 
+      // It's OSC B (Triangle Core)
+      dco_waveshaper_init(pio[blk], sm, pio_offset_triangle[blk], RESET_PINS[i]);
+      osc_uses_sync_program[i] = false;
+      
+      // Initialize the DMA stream feeding this voice!
+      init_dco_dma(voice, pio[blk], sm);
+    } 
+    else {
+      // It's OSC A (Sawtooth Core)
+      if (softSync && i == slave) {
+        frequency_sync_poll_init(pio[blk], sm, pio_offset_sync[blk], RESET_PINS[i], sidesetPin,
+                                 RESET_PINS[master], chunks);
+        osc_uses_sync_program[i] = true;
+      } else {
+        frequency_sync_4_jumps(pio[blk], sm, pio_offset_free[blk], RESET_PINS[i], sidesetPin);
+        osc_uses_sync_program[i] = false;
+      }
+      osc_load_period_stopped(i, pioPulseLength, osc_last_clk_div[i]);
+    }
     enableMask[blk] |= (1u << sm);
   }
 
@@ -178,6 +322,8 @@ void osc_reload_reset_pulse_all(uint32_t y) {
   
   _Pragma("GCC unroll 8")
   for (int i = 0; i < NUM_OSCILLATORS; i++) {
+    if (i % 2 != 0) continue; // SKIPPING OSC B (DMA handles itself)
+    
       const uint32_t weight = osc_ramp_weight(i);
       const uint32_t overhead = osc_period_overhead(i);
       

@@ -159,6 +159,8 @@
 // #define AUTOTUNE_AMP0_MODE_DEFAULT 0    // MEASURE
 // #define AUTOTUNE_AMP0_MODE_DEFAULT 1    // CALC
 
+// Debug level for autotune
+#define AUTOTUNE_DEBUG_LEVEL 4
 // =============================================================================
 // PROFILING / BENCH (see docs/BENCHMARKING.md)
 // =============================================================================
@@ -182,13 +184,13 @@
 
 #ifdef BENCHMARKING_ENABLED
 
-#define ENABLE_SWD_TELEMETRY
+//#define ENABLE_SWD_TELEMETRY
 
-//#define RUNNING_AVERAGE
+#define RUNNING_AVERAGE
 
 #if defined(ENABLE_SWD_TELEMETRY)
   // SWD telemetry enabled, use its specific functions.
-  // #define ENABLE_SWD_PERIOD 
+   #define ENABLE_SWD_PERIOD 
 
 #elif defined(RUNNING_AVERAGE)
   // Basic running average sampling enabled.
@@ -268,10 +270,10 @@
 // GPIO OUTOVER+INOVER invert the pad so soft sync jmp_pin and sub-osc wait keep
 // working. Leave commented for active-high / direct FET discharge. See PIO_OSCILLATORS.md.
 // DCO3 (DG411) defines this; DCO4 (active-high / FET) does not.
-#include "project_config.h"
-#if PROJECT_INSTRUMENT == 3
+// #include "project_config.h"
+// #if PROJECT_INSTRUMENT == 3
 #define ENABLE_PIO_RESET_INVERT
-#endif
+//#endif
 
 //#define ENABLE_PIO_RESET_INVERT
 // =============================================================================
@@ -289,14 +291,20 @@
 
 // PW Polarity Inversion: 0 NOT INVERTED, 1 INVERTED
 #ifndef PW_POLARITY_INVERTED
-#define PW_POLARITY_INVERTED 1
+#define PW_POLARITY_INVERTED 0
 #endif
 // To manually override without PROJECT_INSTRUMENT:
 // #undef PW_SWEEP_MODE_DEFAULT
-// #define PW_SWEEP_MODE_DEFAULT PW_SWEEP_HALF_HIGH
+ #define PW_SWEEP_MODE_DEFAULT 1
 
-// Debug level for autotune
-#define AUTOTUNE_DEBUG_LEVEL 1
+ // Amplitude Compensation Hardware Polarity Flags
+#define AMP_DUTY_INVERT_ALL false
+#define AMP_DUTY_INVERT_OSC_A true
+#define AMP_DUTY_INVERT_OSC_B false
+
+// Amplitude Compensation Target Duty Cycle Flags
+#define AMP_TARGET_DUTY_OSC_A 0.50f
+#define AMP_TARGET_DUTY_OSC_B 0.38f
 
 // =======================================================================
 // PRESETS OPTIONS
