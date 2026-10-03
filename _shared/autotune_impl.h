@@ -314,6 +314,7 @@ void cal_report_reset() {
   }
   calReportLadderInterval = 0;
   calReportAnchorPair     = -1;
+  calReportAmpGrid        = false;
   calRunProbes            = 0;
   calRunStartMs           = millis();
 }
@@ -371,7 +372,9 @@ void print_calibration_report(uint8_t dcoIndex, const uint32_t *data) {
                      : autotune_amp_method_name(autotuneAmpMethod)) +
                   " precision=" + calibration_precision_name(calibrationPrecision) +
                   " search=" + autotune_search_mode_name(autotuneSearchMode);
-  if (calReportLadderInterval > 0) {
+  if (calReportAmpGrid) {
+    header += " amp-grid";
+  } else if (calReportLadderInterval > 0) {
     header += (String)" ladder=" + calReportLadderInterval + " semitones";
   }
   if (calReportAnchorPair >= 0) {

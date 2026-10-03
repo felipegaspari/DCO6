@@ -277,21 +277,21 @@ The achieved (signed) error is kept in `g_lastFreqBisectGapUs` and printed on ev
 
 Builds a 22-pair table by **fixing amps** on a geometric grid and measuring frequency at duty ≈ 50% (`find_freq_for_duty50`). Orientation: amp → freq (not freq-target → guessed amp).
 
-Slot budget: pair 0 = amp-comp 0; pairs **1…20** = measured geometric grid with **last rung amp = `DIV_COUNTER`**; pair 21 = sentinel (amp = `DIV_COUNTER`, freq = 200 kHz).
+Slot budget: pair 0 = amp-comp 0; pairs **1…21** = measured geometric grid with **last pair amp = `DIV_COUNTER`** (real measured frequency). **No** fake 200 kHz sentinel row.
 
 1. **Anchor / manual / re-anchor / bootstrap** — unchanged model probes (`ampComp440`, trimpot amp `A_L`, ±3/±6 amp cluster). Bootstrap is model-only.
-2. **Geometric amp grid**: \(A_k = \mathrm{round}(A_L \cdot (\texttt{DIV_COUNTER}/A_L)^{k/(M-1)})\) for \(M=20\) rungs; force \(A_{M-1}=\texttt{DIV_COUNTER}\); never `DIV_COUNTER+1`. **Nearest-replace** `ampComp440` into an open rung (not the wrap rung unless equal).
+2. **Geometric amp grid**: \(A_k = \mathrm{round}(A_L \cdot (\texttt{DIV_COUNTER}/A_L)^{k/(M-1)})\) for \(M=21\) rungs; force \(A_{M-1}=\texttt{DIV_COUNTER}\); never `DIV_COUNTER+1`. **Nearest-replace** `ampComp440` into an open rung (not the wrap rung unless equal).
 3. **Measure order**: from the grid amp nearest 440 **upward** to `DIV_COUNTER`, then **downward** to `A_L`. Each rung: `fSeed = freq_trace_guess(…, amp)` then `find_freq_for_duty50(amp, fSeed, …)`. No amp retries.
 4. **Pair 0**: amp 0 via CALC/MEASURE; store floor **`kAmp0StoreFloorHz = 0.1`**.
-5. Emit ascending + monotonicity check (last measured amp and sentinel both `DIV_COUNTER` is OK).
+5. Emit ascending + monotonicity check (table ends on measured wrap; runtime plateau uses `AMP_COMP_MAX_HZ` past the table).
 
-`A_L` is the manual baseline **seed / lower bound**, not a frozen unmeasured row — every grid amp is measured.
+`A_L` is the manual baseline **seed / lower bound**, not a frozen unmeasured row — every grid amp is measured. Serial banner: `[FREQ_TRACE] builder=AMP_GEOM_GRID …`; `[CAL_REPORT]` prints `amp-grid` (not `ladder=N semitones`).
 
 ### Fine pass: `refine_DCO_amp_table(ctx)`
 
 The amp stage of a FINE run (param 150 values 5/6/7) does not build a table — it re-measures the one the oscillator already has. Every amp-comp value is kept exactly as stored and only the frequency it really sits at is measured again, so there is no anchor, no bootstrap cluster, no ladder derivation and nothing extrapolated. It is method-agnostic: fixing an amp and finding its 50%-duty frequency is just as valid for a classic table.
 
-1. Read the oscillator's 22 pairs from `freq_to_amp_comp_array[]` (the raw table `init_FS()` loads at boot) and find `topPair`, the first pair at full amp comp — above it the table is sentinel padding with no operating point behind it.
+1. Read the oscillator's 22 pairs from `freq_to_amp_comp_array[]` (the raw table `init_FS()` loads at boot) and find `topPair`, the first pair at full amp comp — above it CLASSIC tables may still have sentinel padding; FREQ_TRACE amp-grid tables end on the measured wrap pair.
 2. Refuse to run on a table that was never calibrated: `topPair` must be at least 4, frequencies strictly increasing, amp comp non-decreasing, and at least 4 distinct amp values (a seeded/fake table is flat). Otherwise `[CAL_REFINE_GUARD] … run a normal calibration first` and the previous table is kept.
 3. For pairs 0..`topPair`, `find_freq_for_duty50(storedAmp, storedFreq, kRefineWindowRatio /*1.02*/, true)`. The stored frequency is the previous answer for that exact amp, so the window is deliberately tight — ±34 cents, giving ~8.5-cent opening steps. A wide window is what let one noisy first reading send a pair hunting far from a value that was already right; with the tight one a pair that really drifted shows up as the search giving up at the window edge and a large `moved=` in the report, which is worth seeing. A pair with no signal keeps its stored frequency and is tagged `filled`.
 4. Sentinels are copied through untouched, and the emitted table goes through the same monotonicity check (`[CAL_REFINE_ERROR]` on failure, table not persisted).
@@ -305,16 +305,16 @@ Both are printed at `autotuneDebug >= 1`, so a quiet run stays quiet.
 **`[CAL_REPORT]`** — printed by `DCO_calibration()` for each oscillator right after the raw 44-value dump (which stays, the panel parses it). Every pair reports where it came from and the duty error achieved when it was measured, so a bad point is visible without re-measuring anything. All three paths fill it: `FREQ_TRACE` records each stored point as it is measured, the classic method uses the per-note `closestToZero` it already tracks, and the fine pass tags every re-measured pair `refined`.
 
 ```
-[CAL_REPORT] DCO=0 method=FREQ_TRACE precision=NORMAL ladder=5 semitones anchorPair=9
+[CAL_REPORT] DCO=0 method=FREQ_TRACE precision=NORMAL amp-grid anchorPair=9
 [CAL_REPORT] pair    freqHz  ampComp  dutyErr%     gapUs    1cnt%  src
 [CAL_REPORT]    0      7.53        0     0.030     39.84        -  endpoint-amp0
 [CAL_REPORT]    1     16.26       28    -0.050    -61.50    1.786  rung
-[CAL_REPORT]   21         - DIV_COUNTER         -         -        -  sentinel
-[CAL_REPORT] DCO=0 lowest=7.53 Hz highest=3938.62 Hz span=9.03 octaves measured=21/22
+[CAL_REPORT]   21   3938.62 DIV_COUNTER  0.040     20.10    0.003  endpoint-full
+[CAL_REPORT] DCO=0 lowest=7.53 Hz highest=3938.62 Hz span=9.03 octaves measured=22/22
 [CAL_REPORT] DCO=0 dutyErr avg=0.05% worst=0.12% at pair 9 (161.20 Hz)
 ```
 
-- `src` is `rung`, `anchor`, `endpoint-full`, `endpoint-amp0`, `manual`, `refined`, `filled` or `sentinel`. Synthetic and sentinel slots print `-` instead of a number, so a padded table cannot be mistaken for a fully measured one, and `measured=N/22` counts only real measurements. `method=REFINE precision=FINE` in the header means the table came out of the fine pass.
+- `src` is `rung`, `anchor`, `endpoint-full`, `endpoint-amp0`, `manual`, `refined`, `filled` or (CLASSIC only) `sentinel`. FREQ_TRACE amp-grid tables have **no** sentinel row — pair 21 is the measured wrap. `method=REFINE precision=FINE` in the header means the table came out of the fine pass.
 - `1cnt%` is the duty change one count of amp comp causes at that point (first order: duty − 0.5 scales with the relative amplitude error, so one count ≈ `50/amp` percentage points). It is the floor for that frequency: a `dutyErr%` already below it is as good as the hardware allows, which is why the lowest notes cannot be improved by more averaging.
 - The `lowest` / `highest` line is the amp-comp-0 and full-amp endpoints, i.e. the reachable frequency range of the oscillator.
 

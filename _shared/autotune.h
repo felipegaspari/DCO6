@@ -278,6 +278,9 @@ uint8_t calPointSource[kCalReportPairs];
 // (0 / -1 = not applicable, e.g. after a classic run).
 int calReportLadderInterval = 0;
 int calReportAnchorPair     = -1;
+// True when the last FREQ_TRACE build used the geometric amp-grid builder
+// (not the obsolete freq-spaced ladder). Drives the CAL_REPORT "amp-grid" label.
+bool calReportAmpGrid       = false;
 
 // What the current oscillator's amp-comp stage has cost so far: duty
 // measurements taken and wall-clock time since cal_report_reset(). These are the

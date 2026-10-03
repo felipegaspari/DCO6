@@ -3,6 +3,10 @@
 
 #include "../include_all.h"
 
+// Canary: autotune_search.ino #errors if this is missing, so a stale
+// DCO-SHARED-LIBRARIES symlink cannot silently revive the freq-ladder path.
+#define FREQ_TRACE_AMP_GEOM_GRID 1
+
 // =============================================================================
 // autotune_search_impl.h — search-based DCO amplitude-compensation calibration.
 //
@@ -1862,16 +1866,25 @@ static bool cal_table_is_monotonic(const uint32_t *data, int numPairs,
 
 // Trace the freq(amp comp) curve by fixing a geometric amp-comp grid and
 // measuring frequency at duty = 50% on each rung (amp → freq). Pair 0 is amp
-// comp 0; pairs 1..20 are the measured grid with the last rung at DIV_COUNTER;
-// pair 21 is the sentinel (same amp, plateau freq). No find_highest_freq; never
-// DIV_COUNTER+1. Returns false when the emitted table fails monotonicity.
+// comp 0; pairs 1..(numPairs-1) are the measured grid with the **last pair**
+// at DIV_COUNTER (real measured freq — no fake 200 kHz sentinel). No
+// find_highest_freq; never DIV_COUNTER+1. Returns false when the emitted table
+// fails monotonicity.
 bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
   constexpr int numPairs   = (int)(chanLevelVoiceDataSize / 2);
   constexpr int firstRung  = 1;              // pair 0 = amp-comp-0 endpoint
-  constexpr int lastRung   = numPairs - 2;   // last measured rung (= DIV_COUNTER)
-  constexpr int sentinelPair = numPairs - 1;
-  constexpr int nRungs     = lastRung - firstRung + 1;  // 20 with 22-pair tables
+  constexpr int lastRung   = numPairs - 1;   // last table pair = measured DIV_COUNTER
+  constexpr int nRungs     = lastRung - firstRung + 1;  // 21 with 22-pair tables
   static_assert(nRungs >= 4, "table needs room for a geometric amp grid");
+
+  // Unmistakable on serial: if this line is missing, the board is not running
+  // the amp-geom builder (stale binary / old shared symlink).
+  Serial.println((String)"[FREQ_TRACE] DCO=" + ctx.dcoIndex +
+                 " builder=AMP_GEOM_GRID A_H=DIV_COUNTER(" + DIV_COUNTER +
+                 ") pairs=" + numPairs +
+                 " (no sentinel, no freq-ladder, never DIV_COUNTER+1)");
+  calReportAmpGrid = true;
+  calReportLadderInterval = 0;  // obsolete freq-ladder label — do not print
 
   // Every point measured in this run feeds freq_trace_guess() seeds.
   constexpr int kMaxKnown = numPairs + 8;
@@ -2149,10 +2162,8 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
     gridWindow = kManualNoteWindowRatio;
   }
 
-  // Report header: approximate semitone spacing from the amp ratio (f∝A).
+  // Approximate cents/step (f∝A) — logged only; CAL_REPORT uses amp-grid label.
   const float stepCents = 1200.0f * log2f(fmaxf(ampStepRatio, 1.0001f));
-  calReportLadderInterval = (int)lroundf(stepCents / 100.0f);
-  if (calReportLadderInterval < 1) calReportLadderInterval = 1;
 
   // Index of the grid amp nearest the 440 Hz anchor — measure ups from here.
   int anchorIdx = 0;
@@ -2170,10 +2181,11 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
   calReportAnchorPair = firstRung + anchorIdx;
 
   Serial.println((String)"[FREQ_TRACE] DCO=" + ctx.dcoIndex +
-                 " geometric grid A_L=" + A_L + " A_H=" + A_H +
+                 " amp-grid A_L=" + A_L + " A_H=" + A_H +
                  " rungs=" + nRungs + " stepRatio=" + ampStepRatio +
                  " ~" + stepCents + " cents anchorIdx=" + anchorIdx +
-                 " ampComp440=" + anchorAmp);
+                 " ampComp440=" + anchorAmp +
+                 " lastRungAmp=" + gridAmp[nRungs - 1]);
 
   for (int k = 0; k < nRungs; ++k) {
     ampByPair[firstRung + k] = gridAmp[k];
@@ -2279,10 +2291,8 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
     }
   }
 
-  // --- Sentinel (same amp as last rung = DIV_COUNTER) -----------------------
-  freqByPair[sentinelPair] = 200000.0f;
-  ampByPair[sentinelPair]  = DIV_COUNTER;
-  cal_report_set_pair(sentinelPair, kCalDutyErrUnknown, CAL_SRC_SENTINEL);
+  // No sentinel: lastRung already holds the measured DIV_COUNTER point.
+  ampByPair[lastRung] = DIV_COUNTER;
 
   if (calibrationCancelRequested) {
     return false;
@@ -2369,10 +2379,20 @@ bool calibrate_DCO_freq_trace(DCOCalibrationContext& ctx) {
   freqByPair[0] = f0Est;
   ampByPair[0]  = 0;
 
-  // --- Emit ------------------------------------------------------------------
+  // --- Emit (hard clamp: never DIV_COUNTER+1; last pair owns full scale) ----
+  ampByPair[lastRung] = DIV_COUNTER;
+  for (int p = 1; p < lastRung; ++p) {
+    if (ampByPair[p] >= DIV_COUNTER) {
+      ampByPair[p] = (uint16_t)(DIV_COUNTER - 1u);
+    }
+  }
   for (int p = 0; p < numPairs; ++p) {
+    uint32_t a = ampByPair[p];
+    if (a > (uint32_t)DIV_COUNTER) {
+      a = (uint32_t)DIV_COUNTER;
+    }
     ctx.calibrationData[2 * p]     = (uint32_t)(freqByPair[p] * 100.0f);
-    ctx.calibrationData[2 * p + 1] = ampByPair[p];
+    ctx.calibrationData[2 * p + 1] = a;
   }
 
   return cal_table_is_monotonic(ctx.calibrationData, numPairs, ctx.dcoIndex,
@@ -2416,8 +2436,9 @@ bool refine_DCO_amp_table(DCOCalibrationContext& ctx) {
     storedAmp[p]  = (uint16_t)a;
   }
 
-  // The last pair worth measuring is the first one at full amp comp; above it
-  // the table is sentinel padding with no operating point behind it.
+  // The last pair worth measuring is the first one at full amp comp. CLASSIC
+  // tables may still pad sentinel rows above it; FREQ_TRACE amp-grid tables end
+  // on the measured DIV_COUNTER pair with no fake 200 kHz sentinel.
   int topPair = -1;
   for (int p = 1; p < numPairs; ++p) {
     if (storedAmp[p] >= DIV_COUNTER) {

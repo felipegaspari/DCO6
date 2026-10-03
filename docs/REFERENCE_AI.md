@@ -357,8 +357,8 @@ Related docs:
     readings bracketing 50 % duty, a bounded search with amp comp fixed at 0, accepted only
     within `kEndpointAcceptDutyPct`.
   - `calibrate_DCO_freq_trace()` — the `FREQ_TRACE` builder: geometric amp grid from manual
-    `A_L` through `DIV_COUNTER` (last rung), nearest-replace `ampComp440`, measure freq at
-    duty 50% (ups from ~440 then lows); pair 0 amp0 floor 0.1 Hz; sentinel amp = `DIV_COUNTER`.
+    `A_L` through `DIV_COUNTER` (last table pair, measured — no 200 kHz sentinel), nearest-replace
+    `ampComp440`, measure freq at duty 50% (ups from ~440 then lows); pair 0 amp0 floor 0.1 Hz.
   - Interpolation helpers: `quadraticInterpolation`, `logarithmicInterpolation`,
     `linearInterpolation`, `expInterpolationSolveY()`.
 
