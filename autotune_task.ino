@@ -8,17 +8,36 @@
 // 1. Hardware Calibration Driver
 // -----------------------------------------------------------------------------
 // Drives a single oscillator at a specific frequency and amplitude (Range PWM).
+// OSC A: classic period word via TXF. OSC B: DMA ring owns TXF; pitch is SM clkdiv
+// (same path as voices.ino bake_waveform → dco_wave_set_clkdiv).
 void autotune_drive_core(uint8_t osc, float freqHz, uint16_t ampValue) {
     PIO pioN = pio[VOICE_TO_PIO[osc]];
     uint8_t sm1N = VOICE_TO_SM[osc];
-  
-    uint32_t total_cycles = (freqHz > 0.0f) ? (uint32_t)fminf(((float)sysClock_Hz / freqHz) + 0.5f, 4.0e9f) : 0u;
-    uint32_t clk_div = total_cycles ? pio_clk_div_for_y(total_cycles, osc_last_y[osc], osc_ramp_weight(osc), osc_period_overhead(osc)) : 0u;
-  
+
     pio_sm_set_enabled(pioN, sm1N, true);
-    pio_sm_put(pioN, sm1N, clk_div);
-    pio_sm_exec(pioN, sm1N, pio_encode_pull(false, false));
-  
+
+    if (osc & 1u) {
+      const uint8_t voice = (uint8_t)(osc >> 1);
+      const uint32_t total_cycles =
+          (freqHz > 0.0f) ? clkdiv_live_total_cycles(sysClock_Hz_cached_float, freqHz)
+                          : 0u;
+      if (total_cycles) {
+        dco_wave_set_clkdiv(voice, total_cycles);
+      }
+    } else {
+      uint32_t total_cycles =
+          (freqHz > 0.0f)
+              ? (uint32_t)fminf(((float)sysClock_Hz / freqHz) + 0.5f, 4.0e9f)
+              : 0u;
+      uint32_t clk_div =
+          total_cycles ? pio_clk_div_for_y(total_cycles, osc_last_y[osc],
+                                           osc_ramp_weight(osc),
+                                           osc_period_overhead(osc))
+                       : 0u;
+      pio_sm_put(pioN, sm1N, clk_div);
+      pio_sm_exec(pioN, sm1N, pio_encode_pull(false, false));
+    }
+
     // 1. Update memory variable
     write_range_pwm(osc, ampValue);
 
@@ -58,8 +77,11 @@ void autotune_manual_task() {
         PIO pioN = pio[VOICE_TO_PIO[i]];
         uint8_t sm1N = VOICE_TO_SM[i];
         pio_sm_set_enabled(pioN, sm1N, false);
-        pio_sm_put(pioN, sm1N, 0);
-        pio_sm_exec(pioN, sm1N, pio_encode_pull(false, false));
+        // OSC B TXF is DMA-fed; do not pio_sm_put into it.
+        if ((i & 1) == 0) {
+          pio_sm_put(pioN, sm1N, 0);
+          pio_sm_exec(pioN, sm1N, pio_encode_pull(false, false));
+        }
 
         pio_park_osc_reset((uint8_t)i, osc_park_reset_level((uint8_t)i));
 
